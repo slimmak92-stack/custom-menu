@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Builds assets/gta6menu.txd (RenderWare TXD, D3D9 platform, uncompressed A8R8G8B8).
 Edit the PNGs in tools/src/ and run:  python3 tools/make_txd.py
-Textures: logo, ic_play, ic_map, ic_gear, ic_script, palms   (names are used by main.cpp)
+Textures: logo, ic_play, ic_map, ic_gear, ic_script, ic_mods, palms   (names are used by main.cpp)
 Open the result in Magic.TXD / TXD Workshop to edit it visually."""
 import struct, os, sys
 from PIL import Image
@@ -27,7 +27,7 @@ def native(name, img):
     return chunk(0x15, chunk(0x01, hdr) + chunk(0x03, b""))
 
 def main():
-    names = ["logo", "ic_play", "ic_map", "ic_gear", "ic_script", "palms"]
+    names = ["logo", "ic_play", "ic_map", "ic_gear", "ic_script", "ic_mods", "palms"]
     natives = []
     for n in names:
         p = os.path.join(SRC, n + ".png")

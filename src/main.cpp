@@ -9,6 +9,7 @@
 #include <windows.h>
 #include <d3d9.h>
 #include <cmath>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -30,13 +31,17 @@ static EndScene_t g_origEndScene = nullptr;
 
 static int g_mx = 0, g_my = 0;           // client coords
 static bool g_down = false, g_click = false, g_keyQ = false, g_keyE = false;
-static int g_page = 0;                   // 0 main, 1 MoonLoader
-static bool g_stockMode = false;         // stock menu page is being shown (overlay hidden)
+static int g_page = 0;                   // 0 main, 1 settings, 2 MoonLoader scripts, 3 Mod Loader mods
+static bool g_stockMode = false;         // a stock page is being shown (overlay hidden)
 static int g_stockReturn = 0;
 static bool g_escWas = false;
+static int g_ignoreEsc = 0;              // our own synthetic ESC presses
 static bool g_wasActive = false;
-static int g_spage = 0;                  // MoonLoader list page
+static int g_spage = 0;                  // list page (scripts / mods)
+static int g_stab = 0;                   // settings tab
 static int g_lastHover = 0;
+// where the stock menu currently is: 0 main, 1 options, 2 options sub-page, 3 map
+static int g_loc = 0, g_mainIdx = 0, g_optIdx = 0;
 
 // config (gta6menu.ini)
 static int g_accent = 0;                 // 0..3
@@ -45,6 +50,8 @@ static int g_h24 = 1;
 static int g_showFps = 0;
 static int g_navMap = 2;                 // DOWN presses from "Resume" to reach "Map"
 static int g_navOptions = 5;             // DOWN presses from "Resume" to reach "Options"
+static int g_mapKey = 0x12;              // key that opens the Lua big map (ALT)
+static std::string g_mapScript = "gps_zone_hud.lua";
 
 static const DWORD kAccents[4] = { 0xFFF2539C, 0xFF40D0FF, 0xFFFF963C, 0xFF5ADC82 };
 static const char* const kAccentNames[4] = { "Pink", "Cyan", "Orange", "Green" };
@@ -69,6 +76,8 @@ static void LoadIni()
     g_bg = std::min(2, std::max(0, (int)GetPrivateProfileIntA("menu", "background", 0, p.c_str())));
     g_h24 = GetPrivateProfileIntA("menu", "clock24", 1, p.c_str()) ? 1 : 0;
     g_showFps = GetPrivateProfileIntA("menu", "showfps", 0, p.c_str()) ? 1 : 0;
+    g_mapKey = std::min(255, std::max(1, (int)GetPrivateProfileIntA("map", "key", 0x12, p.c_str())));
+    { char b[64] = {}; GetPrivateProfileStringA("map", "script", "gps_zone_hud.lua", b, 64, p.c_str()); g_mapScript = b; }
     g_navMap = std::min(12, std::max(0, (int)GetPrivateProfileIntA("stock", "nav_map", 2, p.c_str())));
     g_navOptions = std::min(12, std::max(0, (int)GetPrivateProfileIntA("stock", "nav_options", 5, p.c_str())));
 }
@@ -80,6 +89,8 @@ static void SaveIni()
     sprintf(b, "%d", g_bg);      WritePrivateProfileStringA("menu", "background", b, p.c_str());
     sprintf(b, "%d", g_h24);     WritePrivateProfileStringA("menu", "clock24", b, p.c_str());
     sprintf(b, "%d", g_showFps); WritePrivateProfileStringA("menu", "showfps", b, p.c_str());
+    sprintf(b, "%d", g_mapKey);  WritePrivateProfileStringA("map", "key", b, p.c_str());
+    WritePrivateProfileStringA("map", "script", g_mapScript.c_str(), p.c_str());
     sprintf(b, "%d", g_navMap);  WritePrivateProfileStringA("stock", "nav_map", b, p.c_str());
     sprintf(b, "%d", g_navOptions); WritePrivateProfileStringA("stock", "nav_options", b, p.c_str());
 }
@@ -295,20 +306,38 @@ static void TextC(int font, float x, float y, float w, float h, DWORD col, const
     Text(font, x + (w - TextW(font, s)) * 0.5f, y + (h - TextH(font, s)) * 0.5f, col, s);
 }
 
+// ------------------------------------------------------------ file lookup ---
+static std::string GameDir()
+{
+    char exe[MAX_PATH] = {};
+    GetModuleFileNameA(nullptr, exe, MAX_PATH);
+    std::string d(exe);
+    return d.substr(0, d.find_last_of("\\/") + 1);
+}
+static bool FileExists(const std::string& p) { return GetFileAttributesA(p.c_str()) != INVALID_FILE_ATTRIBUTES; }
+
+// Finds a data file next to the .asi (also works from modloader\<mod>\), else in the game folder,
+// else in modloader\gta6menu\.
+static std::string FindModFile(const char* name)
+{
+    std::string p = IniPath();
+    std::string a = p.substr(0, p.find_last_of("\\/") + 1) + name;
+    if (FileExists(a)) return a;
+    std::string b = GameDir() + name;
+    if (FileExists(b)) return b;
+    std::string c = GameDir() + "modloader\\gta6menu\\" + name;
+    if (FileExists(c)) return c;
+    return a;
+}
+
 // ------------------------------------------------------------ TXD loader ---
 struct TexInfo { IDirect3DTexture9* t; int w, h; };
 static std::unordered_map<std::string, TexInfo> g_tex;
 
-static std::string ModFile(const char* name)
-{
-    std::string p = IniPath();
-    return p.substr(0, p.find_last_of("\\/") + 1) + name;
-}
-
 // Minimal RenderWare TXD reader: D3D9 platform, uncompressed 32-bit A8R8G8B8, level 0 only.
 static void LoadTxd()
 {
-    std::ifstream f(ModFile("gta6menu.txd"), std::ios::binary);
+    std::ifstream f(FindModFile("gta6menu.txd"), std::ios::binary);
     if (!f) return;
     std::vector<BYTE> d((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
     auto u32 = [&](size_t o) -> DWORD { DWORD v = 0; if (o + 4 <= d.size()) std::memcpy(&v, &d[o], 4); return v; };
@@ -322,7 +351,7 @@ static void LoadTxd()
         if (pos + size > d.size()) break;
         if (type == 0x15 && size > 12 + 92 && u32(pos) == 0x01)
         {
-            size_t s = pos + 12;                       // native struct data
+            size_t s = pos + 12;
             char name[33] = {};
             std::memcpy(name, &d[s + 8], 32);
             int w = u16(s + 80), h = u16(s + 82);
@@ -360,53 +389,100 @@ static void DrawTex(const char* n, float x, float y, float w, float h, DWORD col
 }
 
 // ------------------------------------------------ keyboard event queue ---
-// Lets the menu drive the stock pause menu / MoonLoader hotkeys with real key presses.
-struct KeyEv { WORD scan; bool ext; bool down; };
+// Drives the stock pause menu / MoonLoader / Lua hotkeys with real key presses.
+struct KeyEv { WORD scan; WORD vk; bool ext; int kind; };   // kind: 0 up, 1 down, 2 wait(scan = frames)
 static std::vector<KeyEv> g_evq;
 static int g_evDelay = 0;
 
-static void PushKey(WORD scan, bool ext) { g_evq.push_back({ scan, ext, true }); g_evq.push_back({ scan, ext, false }); }
+static void PushKey(WORD scan, bool ext) { g_evq.push_back({ scan, 0, ext, 1 }); g_evq.push_back({ scan, 0, ext, 0 }); }
+static void PushVk(WORD vk) { WORD sc = (WORD)MapVirtualKeyA(vk, 0); g_evq.push_back({ sc, vk, false, 1 }); g_evq.push_back({ sc, vk, false, 0 }); }
+static void PushWait(int frames) { g_evq.push_back({ (WORD)frames, 0, false, 2 }); }
 static void PumpKeys()
 {
     if (g_evq.empty()) return;
     if (g_evDelay > 0) { --g_evDelay; return; }
     KeyEv e = g_evq.front();
     g_evq.erase(g_evq.begin());
+    if (e.kind == 2) { g_evDelay = e.scan; return; }
     INPUT in = {};
     in.type = INPUT_KEYBOARD;
     in.ki.wScan = e.scan;
-    in.ki.dwFlags = KEYEVENTF_SCANCODE | (e.ext ? KEYEVENTF_EXTENDEDKEY : 0) | (e.down ? 0 : KEYEVENTF_KEYUP);
+    if (e.vk) { in.ki.wVk = e.vk; in.ki.dwFlags = e.kind ? 0 : KEYEVENTF_KEYUP; }
+    else in.ki.dwFlags = KEYEVENTF_SCANCODE | (e.ext ? KEYEVENTF_EXTENDEDKEY : 0) | (e.kind ? 0 : KEYEVENTF_KEYUP);
     SendInput(1, &in, sizeof(INPUT));
-    g_evDelay = e.down ? 1 : 3;
+    g_evDelay = e.kind ? 1 : 3;
+}
+
+// ----------------------------------------------- stock menu navigation ---
+static void StockMove(int from, int to)
+{
+    int d = to - from;
+    for (int i = 0; i < std::abs(d); ++i) PushKey(d > 0 ? 0x50 : 0x48, true);   // DOWN / UP arrow
 }
 static void StockResume() { PushKey(0x01, false); }
-static void StockGoto(int downs)
+// every non-main overlay page parks the stock menu on its Options page, so ESC steps back one level
+static void EnterPage(int page)
 {
-    for (int i = 0; i < downs; ++i) PushKey(0x50, true);   // DOWN arrow
-    PushKey(0x1C, false);                                  // ENTER
+    if (g_loc == 0) {
+        StockMove(g_mainIdx, g_navOptions);
+        g_mainIdx = g_navOptions;
+        PushKey(0x1C, false);                              // ENTER
+        g_loc = 1; g_optIdx = 0;
+    }
+    g_page = page;
+    g_spage = 0;
+}
+static void LeavePage()
+{
+    if (g_loc == 1) { PushKey(0x01, false); g_ignoreEsc = 1; g_loc = 0; }
+    g_page = 0;
+}
+static void OpenOptionsCategory(int k)
+{
+    StockMove(g_optIdx, k);
+    g_optIdx = k;
+    PushKey(0x1C, false);
+    g_loc = 2;
     g_stockMode = true;
     g_stockReturn = 0;
 }
+static void OpenStockMap()
+{
+    StockMove(g_mainIdx, g_navMap);
+    g_mainIdx = g_navMap;
+    PushKey(0x1C, false);
+    g_loc = 3;
+    g_stockMode = true;
+    g_stockReturn = 0;
+}
+static bool MapScriptFound() { return !g_mapScript.empty() && FileExists(GameDir() + "moonloader\\" + g_mapScript); }
+static void DoMap()
+{
+    if (MapScriptFound()) {            // use the Lua big map: close the pause menu, then press its key
+        StockResume();
+        PushWait(40);
+        PushVk((WORD)g_mapKey);
+    } else OpenStockMap();
+}
 static void ReloadMoonLoader()
 {
-    g_evq.push_back({ 0x1D, false, true });                // CTRL down
+    g_evq.push_back({ 0x1D, 0, false, 1 });                // CTRL down
     PushKey(0x13, false);                                  // R
-    g_evq.push_back({ 0x1D, false, false });               // CTRL up
+    g_evq.push_back({ 0x1D, 0, false, 0 });                // CTRL up
 }
 
-// --------------------------------------------------- MoonLoader scripts ---
+// ---------------------------------------------- MoonLoader / Mod Loader ---
+struct ModEntry { std::string name; bool disabled; };
 static std::vector<std::string> g_scripts;
-static bool g_moonFound = false;
+static std::vector<ModEntry> g_mods;
+static bool g_moonFound = false, g_modLoaderFound = false;
+
 static void ScanScripts()
 {
     g_scripts.clear();
-    char exe[MAX_PATH] = {};
-    GetModuleFileNameA(nullptr, exe, MAX_PATH);
-    std::string dir(exe);
-    dir = dir.substr(0, dir.find_last_of("\\/") + 1) + "moonloader\\";
+    std::string dir = GameDir() + "moonloader\\";
     const char* patterns[2] = { "*.lua", "*.luac" };
-    for (const char* pat : patterns)
-    {
+    for (const char* pat : patterns) {
         WIN32_FIND_DATAA fd;
         HANDLE h = FindFirstFileA((dir + pat).c_str(), &fd);
         if (h == INVALID_HANDLE_VALUE) continue;
@@ -417,6 +493,31 @@ static void ScanScripts()
     }
     std::sort(g_scripts.begin(), g_scripts.end());
     g_moonFound = GetModuleHandleA("moonloader.asi") != nullptr;
+}
+static void ScanMods()
+{
+    g_mods.clear();
+    std::string dir = GameDir() + "modloader\\";
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA((dir + "*").c_str(), &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            std::string n = fd.cFileName;
+            if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || n == "." || n == ".." || n == ".data") continue;
+            bool dis = n[0] == '.';
+            g_mods.push_back({ dis ? n.substr(1) : n, dis });
+        } while (FindNextFileA(h, &fd));
+        FindClose(h);
+    }
+    std::sort(g_mods.begin(), g_mods.end(), [](const ModEntry& a, const ModEntry& b) { return a.name < b.name; });
+    g_modLoaderFound = GetModuleHandleA("modloader.asi") != nullptr || FileExists(dir);
+}
+// Mod Loader ignores folders that start with a dot, so renaming enables/disables a mod
+static bool ToggleMod(const ModEntry& m)
+{
+    std::string dir = GameDir() + "modloader\\";
+    std::string on = dir + m.name, off = dir + "." + m.name;
+    return MoveFileA(m.disabled ? off.c_str() : on.c_str(), m.disabled ? on.c_str() : off.c_str()) != 0;
 }
 
 // ------------------------------------------------------------------ ui ---
@@ -432,7 +533,6 @@ static void KeyCap(float& x, float y, const char* key, const char* label, float 
     Text(0, kx - 12 * S - lw, y + (h - TextH(0, label)) * 0.5f, WHITE, label);
     x = kx - 12 * S - lw - 36 * S;
 }
-
 static void WrapText(float x, float y, float maxw, DWORD col, const char* text)
 {
     std::string line, word, d = std::string(text) + " ";
@@ -447,6 +547,7 @@ static void WrapText(float x, float y, float maxw, DWORD col, const char* text)
     }
     if (!line.empty()) Text(1, x, y, col, line.c_str());
 }
+static std::string Upper(std::string s) { for (char& c : s) if (c >= 'a' && c <= 'z') c = (char)(c - 32); return s; }
 
 static void DrawBackground(int style)
 {
@@ -456,7 +557,11 @@ static void DrawBackground(int style)
     static const DWORD bl[3] = { 0xFF8A4A92, 0xFF2A1A50, 0xFFC8506E };
     Grad4(0, 0, W, H, tl[style], tr[style], br[style], bl[style]);
 }
-
+static void DrawPurpleBackground()
+{
+    Grad4(0, 0, W, H, 0xFF762F80, 0xFF8E4196, 0xFF6C2B78, 0xFF5B2166);
+    DrawTex("palms", W - H * 1.05f, H - H * 0.95f, H, H);
+}
 static void DrawClock()
 {
     SYSTEMTIME st; GetLocalTime(&st);
@@ -471,37 +576,57 @@ static void DrawClock()
     Line(cx, cy, cx + r * 0.5f, cy + r * 0.2f, 3 * S, kAccents[g_accent]);
 }
 
+// white-fade row used by every list
+static bool ListRow(float x, float y, float w, float h, bool selectable)
+{
+    bool hov = selectable && Hit(x, y, w, h, (float)g_mx, (float)g_my);
+    if (hov) {
+        Rect(x, y, w * 0.55f, h, WHITE);
+        GradH(x + w * 0.55f, y, w * 0.45f, h, WHITE, 0x38FFFFFF);
+    } else Rect(x, y + h - 1, w, 1, 0x2EFFFFFF);
+    return hov;
+}
+static void BackHints(bool click, const char* pageLabel)
+{
+    float hx = W - 50 * S, hy = H - 62 * S - 17 * S;
+    float bw = TextW(0, "ESC") + 22 * S, lw = TextW(0, "BACK");
+    float backX = hx - bw - 12 * S - lw;
+    if (click && Hit(backX, hy, bw + 12 * S + lw, 34 * S, (float)g_mx, (float)g_my)) LeavePage();
+    KeyCap(hx, hy, "ESC", "BACK", 34 * S);
+    KeyCap(hx, hy, "Q E", pageLabel, 34 * S);
+}
+
+// ---- main page ----
 static void DrawMainPage(bool click)
 {
     DrawBackground(g_bg);
     float sbw = W * 0.25f;
     Rect(0, 0, sbw, H, 0xFF1B1A2B);
 
-    // logo (from gta6menu.txd)
     if (const TexInfo* lg = FindTex("logo")) {
         float lh = 150 * S, lw = lh * lg->w / lg->h;
         DrawTex("logo", 40 * S, 26 * S, lw, lh);
-    } else {
-        Text(3, 56 * S, 36 * S, WHITE, "SA");
-    }
+    } else Text(3, 56 * S, 36 * S, WHITE, "SA");
 
-    static const char* const names[4] = { "Resume", "Map", "Settings", "MoonLoader" };
-    static const char* const icons[4] = { "ic_play", "ic_map", "ic_gear", "ic_script" };
-    static const char* const descs[4] = {
+    static const char* const names[5] = { "Resume", "Map", "Settings", "MoonLoader", "Mod Loader" };
+    static const char* const icons[5] = { "ic_play", "ic_map", "ic_gear", "ic_script", "ic_mods" };
+    const bool lua = MapScriptFound();
+    const char* descs[5] = {
         "Return to the game.",
-        "Open the world map.",
-        "Display, audio, controls and the rest of the game options.",
-        "Lua scripts found in your moonloader folder, and a one-click reload." };
-    int hovered = -1;
-    for (int i = 0; i < 4; ++i) {
+        lua ? "Open the GPS big map from your gps_zone_hud script." : "Open the world map.",
+        "Controller, audio, display, language and this menu's own settings.",
+        "Lua scripts found in your moonloader folder, with a one-click reload.",
+        "Turn the mods in your modloader folder on or off." };
+    for (int i = 0; i < 5; ++i) {
         float x = 30 * S, y = (214 + i * 58) * S, w = sbw - 60 * S, h = 52 * S;
         bool hov = Hit(x, y, w, h, (float)g_mx, (float)g_my);
-        if (hov) { hovered = i; g_lastHover = i; }
+        if (hov) g_lastHover = i;
         if (hov && click) {
             if (i == 0) StockResume();
-            else if (i == 1) StockGoto(g_navMap);
-            else if (i == 2) StockGoto(g_navOptions);
-            else { g_page = 1; g_spage = 0; ScanScripts(); }
+            else if (i == 1) DoMap();
+            else if (i == 2) { EnterPage(1); g_stab = 0; }
+            else if (i == 3) { ScanScripts(); EnterPage(2); }
+            else { ScanMods(); EnterPage(3); }
         }
         DWORD fg = hov ? INK : WHITE;
         if (hov) {
@@ -512,9 +637,7 @@ static void DrawMainPage(bool click)
         DrawTex(icons[i], x + 16 * S, y + (h - is) * 0.5f, is, is, fg);
         Text(1, x + 70 * S, y + (h - TextH(1, names[i])) * 0.5f, fg, names[i]);
     }
-    (void)hovered;
 
-    // content: title + description of the last hovered entry
     float cx = sbw + 40 * S;
     Text(2, cx, 150 * S, WHITE, names[g_lastHover]);
     WrapText(cx, 236 * S, W - sbw - 120 * S, 0xDCFFFFFF, descs[g_lastHover]);
@@ -525,71 +648,172 @@ static void DrawMainPage(bool click)
     KeyCap(hx, hy, "ENTER", "SELECT", 34 * S);
 }
 
-static void DrawScriptsPage(bool click, bool keyQ, bool keyE)
+// ---- settings page: stock categories (skinned) + this menu's own settings ----
+struct Setting { int tab; int kind; const char* label; const char* desc; int* val; int mn, mx; const char* const* opts; int link; };
+// kinds: 0 toggle, 2 cycle, 3 action, 4 link to a stock Options sub-page
+static Setting g_settings[] = {
+    { 0, 4, "Controller setup", "Open the original controller setup: mouse, keyboard and gamepad options.", nullptr, 0, 0, nullptr, 0 },
+    { 0, 4, "Audio setup", "Open the original audio setup: volumes, radio and equaliser.", nullptr, 0, 0, nullptr, 1 },
+    { 0, 4, "Display setup", "Open the original display setup: brightness, resolution, anti-aliasing and the HUD.", nullptr, 0, 0, nullptr, 2 },
+    { 0, 4, "Language", "Open the original language page.", nullptr, 0, 0, nullptr, 3 },
+    { 0, 4, "Mod configuration", "Open the mod configuration page added by your mods.", nullptr, 0, 0, nullptr, 4 },
+    { 1, 2, "Accent colour", "Colour of the clock, toggles and highlights in this menu.", &g_accent, 0, 3, kAccentNames, 0 },
+    { 1, 2, "Background", "Backdrop gradient shown behind the main page.", &g_bg, 0, 2, kBgNames, 0 },
+    { 1, 0, "24-hour clock", "Show the clock in 24-hour format instead of AM/PM.", &g_h24, 0, 1, nullptr, 0 },
+    { 1, 0, "Show FPS", "Show the frame rate in the top-left corner.", &g_showFps, 0, 1, nullptr, 0 },
+    { 1, 3, "Restore defaults", "Reset this menu's own settings to their defaults.", nullptr, 0, 0, nullptr, 0 },
+};
+static const char* const kSettingsTabs[2] = { "GAME OPTIONS", "THIS MENU" };
+
+static void DrawSettingRow(int idx, const Setting& s, float x, float y, float w, float h, bool click, int& hoverRow)
 {
-    Grad4(0, 0, W, H, 0xFF762F80, 0xFF8E4196, 0xFF6C2B78, 0xFF5B2166);
-    DrawTex("palms", W - H * 1.05f, H - H * 0.95f, H, H);
+    bool hov = ListRow(x, y, w, h, true);
+    if (hov) hoverRow = idx;
+    DWORD fg = hov ? INK : WHITE;
+    float ty = y + (h - TextH(1, s.label)) * 0.5f;
+    Text(1, x + 22 * S, ty, fg, s.label);
+    float rx = x + w - 50 * S;
+    if (s.kind == 4) {
+        float cy = y + h * 0.5f, a = 8 * S;
+        Line(rx - a, cy - a, rx, cy, 3 * S, fg);
+        Line(rx, cy, rx - a, cy + a, 3 * S, fg);
+        if (hov && click) OpenOptionsCategory(s.link);
+    } else if (s.kind == 3) {
+        if (hov && click) { g_accent = 0; g_bg = 0; g_h24 = 1; g_showFps = 0; SaveIni(); }
+    } else if (s.kind == 0) {
+        if (hov && click) { *s.val = !*s.val; SaveIni(); }
+        bool on = *s.val != 0;
+        float pw = 84 * S, ph = 34 * S, px = rx - pw, py = y + (h - ph) * 0.5f;
+        Pill(px, py, pw, ph, on ? kAccents[g_accent] : (hov ? 0x64000000 : 0x64FFFFFF));
+        Circle(on ? px + pw - ph * 0.5f : px + ph * 0.5f, py + ph * 0.5f, ph * 0.5f - 4 * S, WHITE);
+        TextR(1, px - 16 * S, ty, fg, on ? "On" : "Off");
+    } else if (s.kind == 2) {
+        int n = s.mx - s.mn + 1;
+        const char* label = s.opts[*s.val];
+        float vw = TextW(1, label), aw = 22 * S;
+        float cr = rx, cl = cr - (aw * 2 + vw + 28 * S);
+        if (hov && click) {
+            int dir = 1;
+            if ((float)g_mx >= cl && (float)g_mx <= cr && (float)g_mx < (cl + cr) * 0.5f) dir = -1;
+            *s.val = ((*s.val - s.mn + dir) % n + n) % n + s.mn;
+            SaveIni();
+            label = s.opts[*s.val];
+        }
+        Text(1, cl + aw + 14 * S, ty, fg, label);
+        float cy = y + h * 0.5f, a = 7 * S, lx = cl + aw * 0.5f, rr = cr - aw * 0.5f;
+        Line(lx + a * 0.5f, cy - a, lx - a * 0.5f, cy, 2.5f * S, fg);
+        Line(lx - a * 0.5f, cy, lx + a * 0.5f, cy + a, 2.5f * S, fg);
+        Line(rr - a * 0.5f, cy - a, rr + a * 0.5f, cy, 2.5f * S, fg);
+        Line(rr + a * 0.5f, cy, rr - a * 0.5f, cy + a, 2.5f * S, fg);
+    }
+}
 
-    Text(2, 32 * S, 22 * S, WHITE, "MOONLOADER");
-    Text(0, 32 * S, 84 * S, 0xC8FFFFFF, g_moonFound ? "MoonLoader detected" : "MoonLoader not detected (moonloader.asi not loaded)");
+static void DrawSettingsPage(bool click, bool keyQ, bool keyE)
+{
+    DrawPurpleBackground();
+    if (keyQ || keyE) g_stab = (g_stab + 1) % 2;
 
-    const int perPage = 8;
-    int total = (int)g_scripts.size();
+    Text(2, 32 * S, 22 * S, WHITE, "SETTINGS");
+    float tx = 32 * S;
+    for (int i = 0; i < 2; ++i) {
+        float tw = TextW(0, kSettingsTabs[i]) + 40 * S, th = 38 * S, ty = 78 * S;
+        bool hov = Hit(tx, ty, tw, th, (float)g_mx, (float)g_my);
+        if (hov && click) g_stab = i;
+        bool act = g_stab == i;
+        Rect(tx, ty, tw, th, act ? WHITE : (hov ? 0x5AFFFFFF : 0x32FFFFFF));
+        TextC(0, tx, ty, tw, th, act ? INK : WHITE, kSettingsTabs[i]);
+        tx += tw + 6 * S;
+    }
+    Text(2, 32 * S, 150 * S, WHITE, kSettingsTabs[g_stab]);
+
+    int hoverRow = -1, row = 0, firstIdx = -1;
+    for (int i = 0; i < (int)(sizeof(g_settings) / sizeof(g_settings[0])); ++i) {
+        if (g_settings[i].tab != g_stab) continue;
+        if (firstIdx < 0) firstIdx = i;
+        int shownIdx = -1;
+        DrawSettingRow(i, g_settings[i], 32 * S, (247 + row * 68) * S, 932 * S, 68 * S, click, shownIdx);
+        if (shownIdx >= 0) hoverRow = shownIdx;
+        ++row;
+    }
+    const Setting* shown = &g_settings[hoverRow >= 0 ? hoverRow : (firstIdx >= 0 ? firstIdx : 0)];
+    float dx = 1178 * S;
+    Text(2, dx, 150 * S, WHITE, Upper(shown->label).c_str());
+    Rect(dx, 216 * S, 640 * S, 2 * S, 0x5AFFFFFF);
+    WrapText(dx, 238 * S, 640 * S, 0xE6FFFFFF, shown->desc);
+
+    char pg[16]; sprintf(pg, "%d / 2", g_stab + 1);
+    Text(1, 48 * S, H - 150 * S, WHITE, pg);
+    BackHints(click, "TABS");
+}
+
+// ---- MoonLoader scripts (mode 2) and Mod Loader mods (mode 3) ----
+static void DrawListPage(int mode, bool click, bool keyQ, bool keyE)
+{
+    DrawPurpleBackground();
+    const bool scripts = (mode == 2);
+    Text(2, 32 * S, 22 * S, WHITE, scripts ? "MOONLOADER" : "MOD LOADER");
+    bool found = scripts ? g_moonFound : g_modLoaderFound;
+    const char* status = scripts ? (found ? "MoonLoader detected" : "MoonLoader not detected (moonloader.asi not loaded)")
+                                 : (found ? "Mod Loader detected" : "Mod Loader not detected (no modloader folder)");
+    Text(0, 32 * S, 84 * S, 0xC8FFFFFF, status);
+
+    const int perPage = scripts ? 8 : 9;
+    int total = scripts ? (int)g_scripts.size() : (int)g_mods.size();
     int pages = std::max(1, (total + perPage - 1) / perPage);
     if (keyE) g_spage = (g_spage + 1) % pages;
     if (keyQ) g_spage = (g_spage + pages - 1) % pages;
     g_spage = std::min(g_spage, pages - 1);
 
-    Text(2, 32 * S, 150 * S, WHITE, "SCRIPTS");
-    int hoverRow = -2;     // -1 = reload row
+    Text(2, 32 * S, 150 * S, WHITE, scripts ? "SCRIPTS" : "MODS");
+    int hoverRow = -2;
     std::string hoverName;
-    for (int r = 0; r < perPage + 1; ++r) {
+    int rows = perPage + (scripts ? 1 : 0);
+    for (int r = 0; r < rows; ++r) {
         float x = 32 * S, y = (247 + r * 68) * S, w = 932 * S, h = 68 * S;
-        std::string label;
-        bool action = (r == 0);
+        std::string label; bool action = scripts && r == 0, dis = false; int modIdx = -1;
         if (action) label = "Reload all scripts";
         else {
-            int idx = g_spage * perPage + (r - 1);
+            int idx = g_spage * perPage + (r - (scripts ? 1 : 0));
             if (idx >= total) break;
-            label = g_scripts[idx];
+            if (scripts) label = g_scripts[idx];
+            else { label = g_mods[idx].name; dis = g_mods[idx].disabled; modIdx = idx; }
         }
-        bool hov = Hit(x, y, w, h, (float)g_mx, (float)g_my);
+        bool hov = ListRow(x, y, w, h, true);
         if (hov) { hoverRow = r; hoverName = label; }
         DWORD fg = hov ? INK : WHITE;
-        if (hov) {
-            Rect(x, y, w * 0.55f, h, WHITE);
-            GradH(x + w * 0.55f, y, w * 0.45f, h, WHITE, 0x38FFFFFF);
-        } else Rect(x, y + h - 1, w, 1, 0x2EFFFFFF);
+        if (dis && !hov) fg = 0x96FFFFFF;
         Text(1, x + 22 * S, y + (h - TextH(1, label.c_str())) * 0.5f, fg, label.c_str());
+        float rx = x + w - 50 * S;
         if (action) {
             if (hov && click) ReloadMoonLoader();
-            DrawTex("ic_script", x + w - 50 * S - 34 * S, y + (h - 34 * S) * 0.5f, 34 * S, 34 * S, fg);
+            DrawTex("ic_script", rx - 34 * S, y + (h - 34 * S) * 0.5f, 34 * S, 34 * S, fg);
+        } else if (!scripts) {
+            bool on = !dis;
+            float pw = 84 * S, ph = 34 * S, px = rx - pw, py = y + (h - ph) * 0.5f;
+            if (hov && click && modIdx >= 0) { ToggleMod(g_mods[modIdx]); ScanMods(); }
+            Pill(px, py, pw, ph, on ? kAccents[g_accent] : (hov ? 0x64000000 : 0x64FFFFFF));
+            Circle(on ? px + pw - ph * 0.5f : px + ph * 0.5f, py + ph * 0.5f, ph * 0.5f - 4 * S, WHITE);
+            TextR(1, px - 16 * S, y + (h - TextH(1, "On")) * 0.5f, fg, on ? "On" : "Off");
         }
     }
 
-    // right panel
     float dx = 1178 * S;
-    std::string title = hoverRow >= 0 ? hoverName : "SCRIPTS";
-    for (char& ch : title) if (ch >= 'a' && ch <= 'z') ch = (char)(ch - 32);
+    std::string title = hoverRow >= -1 && !hoverName.empty() ? Upper(hoverName) : (scripts ? "SCRIPTS" : "MODS");
     if (TextW(2, title.c_str()) > 640 * S) title = title.substr(0, 14) + "...";
     Text(2, dx, 150 * S, WHITE, title.c_str());
     Rect(dx, 216 * S, 640 * S, 2 * S, 0x5AFFFFFF);
-    const char* desc = hoverRow == 0 ? "Sends CTRL+R, MoonLoader's default hotkey, to reload every script."
-                     : hoverRow > 0 ? "Lua script found in your moonloader folder."
-                                    : "Lua scripts found in your moonloader folder.";
+    const char* desc;
+    if (scripts) desc = hoverRow == 0 ? "Sends CTRL+R, MoonLoader's default hotkey, to reload every script."
+                       : hoverRow > 0 ? "Lua script found in your moonloader folder." : "Lua scripts found in your moonloader folder.";
+    else desc = hoverRow >= 0 ? "Click to enable or disable this mod. Mod Loader reads its folders again the next time the game starts."
+                              : "Mods found in your modloader folder. A folder that starts with a dot is disabled.";
     WrapText(dx, 238 * S, 640 * S, 0xE6FFFFFF, desc);
-    char b[64]; sprintf(b, "%d script%s found", total, total == 1 ? "" : "s");
-    Text(1, dx, 420 * S, 0xC8FFFFFF, b);
+    char b[64]; sprintf(b, "%d %s found", total, scripts ? (total == 1 ? "script" : "scripts") : (total == 1 ? "mod" : "mods"));
+    Text(1, dx, 470 * S, 0xC8FFFFFF, b);
 
     char pg[24]; sprintf(pg, "%d / %d", g_spage + 1, pages);
     Text(1, 48 * S, H - 150 * S, WHITE, pg);
-
-    float hx = W - 50 * S, hy = H - 62 * S - 17 * S;
-    float bw = TextW(0, "ESC") + 22 * S, lw = TextW(0, "BACK");
-    float backX = hx - bw - 12 * S - lw;
-    if (click && Hit(backX, hy, bw + 12 * S + lw, 34 * S, (float)g_mx, (float)g_my)) g_page = 0;
-    KeyCap(hx, hy, "ESC", "BACK", 34 * S);
-    KeyCap(hx, hy, "Q E", "PAGE", 34 * S);
+    BackHints(click, "PAGE");
 }
 
 static void DrawCursor()
@@ -604,23 +828,28 @@ static void DrawCursor()
 
 static void Frame()
 {
+    PumpKeys();                                     // keeps running after the menu closes (Lua map key)
     bool active = *kMenuActive == 1;
     if (!active) {
-        if (g_wasActive) { g_page = 0; g_stockMode = false; g_stockReturn = 0; g_evq.clear(); g_evDelay = 0; }
+        if (g_wasActive) { g_page = 0; g_stockMode = false; g_stockReturn = 0; g_loc = 0; g_mainIdx = 0; g_optIdx = 0; g_ignoreEsc = 0; }
         g_wasActive = false;
         g_click = false;
         return;
     }
     g_wasActive = true;
-    PumpKeys();
 
-    // leaving a stock page with ESC brings our menu back
+    // ESC tracking: keeps our idea of the stock page in sync and brings the overlay back
     bool esc = (GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0;
-    if (g_stockMode) {
-        if (esc && !g_escWas && g_evq.empty()) g_stockReturn = 14;
-        if (g_stockReturn > 0 && --g_stockReturn == 0) g_stockMode = false;
+    if (esc && !g_escWas) {
+        if (g_ignoreEsc > 0) --g_ignoreEsc;
+        else if (g_stockMode) {
+            if (g_loc == 2) g_loc = 1; else if (g_loc == 3) g_loc = 0;
+            g_stockReturn = 14;
+        }
+        else if (g_page != 0 && g_loc == 1) { g_loc = 0; g_page = 0; }
     }
     g_escWas = esc;
+    if (g_stockMode && g_stockReturn > 0 && --g_stockReturn == 0) g_stockMode = false;
 
     D3DVIEWPORT9 vp;
     if (FAILED(g_dev->GetViewport(&vp)) || vp.Width < 320) return;
@@ -646,7 +875,9 @@ static void Frame()
         Rect((W - tw) * 0.5f, H - 90 * S, tw, th, 0xB4141028);
         TextC(0, (W - tw) * 0.5f, H - 90 * S, tw, th, WHITE, msg);
     } else {
-        if (g_page == 1) DrawScriptsPage(click, keyQ, keyE); else DrawMainPage(click);
+        if (g_page == 1) DrawSettingsPage(click, keyQ, keyE);
+        else if (g_page == 2 || g_page == 3) DrawListPage(g_page, click, keyQ, keyE);
+        else DrawMainPage(click);
         if (g_showFps) {
             static DWORD last = GetTickCount(); static int frames = 0; static int fps = 0;
             ++frames; DWORD now = GetTickCount();
