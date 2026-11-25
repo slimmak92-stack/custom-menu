@@ -34,3 +34,6 @@ How the stock-menu part works (v3)
   DOWN/ENTER from there, so it never depends on a remembered highlight.
   Inside a stock page use the pill at the bottom ("Click here to return to the GTA 6 menu").
   ESC on an overlay page = back, ESC on the main page = resume.
+
+Diagnostics: the menu writes gta6menu.log next to the .asi (init, hook, menu open/close, every key it
+sends, every click). If something misbehaves, send that file.

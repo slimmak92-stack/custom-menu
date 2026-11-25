@@ -10,6 +10,7 @@
 #include <d3d9.h>
 #include <cmath>
 #include <cstdlib>
+#include <cstdarg>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -66,6 +67,21 @@ static std::string IniPath()
     size_t s = p.find_last_of("\\/");
     return (s == std::string::npos ? std::string() : p.substr(0, s + 1)) + "gta6menu.ini";
 }
+static void Log(const char* fmt, ...)
+{
+    static int count = 0;
+    if (count > 4000) return;                       // keep the log small
+    ++count;
+    std::string p = IniPath();
+    p = p.substr(0, p.find_last_of('.')) + ".log";
+    FILE* f = std::fopen(p.c_str(), count == 1 ? "w" : "a");
+    if (!f) return;
+    std::fprintf(f, "[%8lu] ", (unsigned long)GetTickCount());
+    va_list ap; va_start(ap, fmt); std::vfprintf(f, fmt, ap); va_end(ap);
+    std::fprintf(f, "\n");
+    std::fclose(f);
+}
+
 static void LoadIni()
 {
     const std::string p = IniPath();
@@ -406,6 +422,7 @@ static void PumpKeys()
     in.ki.wScan = e.scan;
     if (e.vk) { in.ki.wVk = e.vk; in.ki.dwFlags = e.kind ? 0 : KEYEVENTF_KEYUP; }
     else in.ki.dwFlags = KEYEVENTF_SCANCODE | (e.ext ? KEYEVENTF_EXTENDEDKEY : 0) | (e.kind ? 0 : KEYEVENTF_KEYUP);
+    Log("key %s scan=0x%02X vk=0x%02X ext=%d", e.kind ? "DOWN" : "UP", e.scan, e.vk, e.ext ? 1 : 0);
     SendInput(1, &in, sizeof(INPUT));
     g_evDelay = e.kind ? 1 : 3;
 }
@@ -433,6 +450,7 @@ static void RunSteps(bool active)
     if (g_stepWait > 0) { --g_stepWait; return; }
     if (g_steps.empty()) return;
     Step s = g_steps.front();
+    Log("step kind=%d a=%d b=%d c=%d active=%d left=%d", s.kind, s.a, s.b, s.c, active ? 1 : 0, (int)g_steps.size());
     switch (s.kind) {
     case S_KEY:  for (int i = 0; i < s.c; ++i) PushKey((WORD)s.a, s.b != 0); g_steps.erase(g_steps.begin()); break;
     case S_WAIT: g_stepWait = s.a; g_steps.erase(g_steps.begin()); break;
@@ -846,6 +864,8 @@ static void Frame()
     bool active = *kMenuActive == 1;
     RunSteps(active);
 
+    static int lastActive = -1;
+    if ((int)active != lastActive) { Log("stock menu active=%d page=%d stockMode=%d busy=%d", active ? 1 : 0, g_page, g_stockMode ? 1 : 0, Busy() ? 1 : 0); lastActive = active ? 1 : 0; }
     if (!active) {
         g_overlayVisible = false;
         if (g_wasActive && !Busy()) { g_wasActive = false; g_page = 0; g_stockMode = false; g_steps.clear(); }
@@ -860,6 +880,7 @@ static void Frame()
 
     // physical ESC (ours are ignored while busy)
     bool esc = (GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0;
+    if (esc && !g_escWas) Log("ESC pressed busy=%d stockMode=%d page=%d", Busy() ? 1 : 0, g_stockMode ? 1 : 0, g_page);
     if (esc && !g_escWas && !Busy() && !g_stockMode) {
         if (g_page != 0) { g_page = 0; g_steps.clear(); AddReset(); AddPark(); }   // back to our main page
         else { AddWait(2); AddKey(0x01, false); }                                  // stock is on its main page: resume
@@ -877,6 +898,7 @@ static void Frame()
     g_mx = (int)(rawX * W / cw); g_my = (int)(rawY * H / ch);
 
     bool click = g_click, keyQ = g_keyQ, keyE = g_keyE;
+    if (click) Log("click at %d,%d page=%d stockMode=%d busy=%d", g_mx, g_my, g_page, g_stockMode ? 1 : 0, Busy() ? 1 : 0);
     g_click = g_keyQ = g_keyE = false;
     g_overlayVisible = !g_stockMode;
 
@@ -913,6 +935,8 @@ static void Frame()
 // ---------------------------------------------------------------- hooks ---
 static HRESULT WINAPI HookedEndScene(IDirect3DDevice9* dev)
 {
+    static bool first = true;
+    if (first) { first = false; Log("first EndScene call (hook is running)"); }
     if (dev == g_dev) {
         IDirect3DSurface9 *rt = nullptr, *bb = nullptr;
         dev->GetRenderTarget(0, &rt);
@@ -948,12 +972,15 @@ static DWORD WINAPI InitThread(LPVOID)
     }
     Sleep(1500);
 
+    Log("device found %p", (void*)g_dev);
     D3DDEVICE_CREATION_PARAMETERS cp = {};
     if (SUCCEEDED(g_dev->GetCreationParameters(&cp))) g_hwnd = cp.hFocusWindow;
     if (!g_hwnd) g_hwnd = GetForegroundWindow();
 
     LoadIni();
     LoadTxd();
+    Log("txd textures loaded: %d (gta6menu.txd at %s)", (int)g_tex.size(), FindModFile("gta6menu.txd").c_str());
+    Log("map script '%s' found=%d key=0x%X", g_mapScript.c_str(), MapScriptFound() ? 1 : 0, g_mapKey);
 
     void** vtbl = *reinterpret_cast<void***>(g_dev);
     DWORD old = 0;
@@ -962,6 +989,7 @@ static DWORD WINAPI InitThread(LPVOID)
         vtbl[42] = reinterpret_cast<void*>(&HookedEndScene);
         VirtualProtect(&vtbl[42], sizeof(void*), old, &old);
     }
+    Log("EndScene hooked=%d hwnd=%p", g_origEndScene ? 1 : 0, (void*)g_hwnd);
     if (g_hwnd) g_oldProc = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(g_hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(&HookedWndProc)));
     return 0;
 }
