@@ -314,7 +314,7 @@ static void LoadTxd()
     auto u32 = [&](size_t o) -> DWORD { DWORD v = 0; if (o + 4 <= d.size()) std::memcpy(&v, &d[o], 4); return v; };
     auto u16 = [&](size_t o) -> int { WORD v = 0; if (o + 2 <= d.size()) std::memcpy(&v, &d[o], 2); return v; };
     if (d.size() < 12 || u32(0) != 0x16) return;
-    size_t pos = 12, end = std::min(d.size(), (size_t)12 + u32(4));
+    size_t pos = 12, end = std::min<size_t>(d.size(), (size_t)12 + (size_t)u32(4));
     while (pos + 12 <= end)
     {
         DWORD type = u32(pos), size = u32(pos + 4);
