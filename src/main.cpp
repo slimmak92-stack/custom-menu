@@ -933,10 +933,11 @@ static void Frame()
 }
 
 // ---------------------------------------------------------------- hooks ---
+static void InitOnRenderThread(IDirect3DDevice9* dev);
 static HRESULT WINAPI HookedEndScene(IDirect3DDevice9* dev)
 {
-    static bool first = true;
-    if (first) { first = false; Log("first EndScene call (hook is running)"); }
+    static bool inited = false;
+    if (!inited && dev == g_dev) { inited = true; Log("first EndScene call (hook is running)"); InitOnRenderThread(dev); }
     if (dev == g_dev) {
         IDirect3DSurface9 *rt = nullptr, *bb = nullptr;
         dev->GetRenderTarget(0, &rt);
@@ -962,6 +963,22 @@ static LRESULT CALLBACK HookedWndProc(HWND h, UINT m, WPARAM w, LPARAM l)
     return CallWindowProcW(g_oldProc, h, m, w, l);
 }
 
+// Runs on the game's render thread (first EndScene): all Direct3D / file work happens here,
+// never from our own thread (the device is not thread-safe while the game is loading).
+static void InitOnRenderThread(IDirect3DDevice9* dev)
+{
+    Log("render-thread init start");
+    D3DDEVICE_CREATION_PARAMETERS cp = {};
+    if (SUCCEEDED(dev->GetCreationParameters(&cp))) g_hwnd = cp.hFocusWindow;
+    if (!g_hwnd) g_hwnd = GetForegroundWindow();
+    LoadIni();
+    LoadTxd();
+    Log("txd textures loaded: %d (gta6menu.txd at %s)", (int)g_tex.size(), FindModFile("gta6menu.txd").c_str());
+    Log("map script '%s' found=%d key=0x%X", g_mapScript.c_str(), MapScriptFound() ? 1 : 0, g_mapKey);
+    if (g_hwnd) g_oldProc = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(g_hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(&HookedWndProc)));
+    Log("render-thread init done hwnd=%p", (void*)g_hwnd);
+}
+
 static DWORD WINAPI InitThread(LPVOID)
 {
     for (;;) {
@@ -970,18 +987,10 @@ static DWORD WINAPI InitThread(LPVOID)
         if (d) { g_dev = d; break; }
         Sleep(200);
     }
-    Sleep(1500);
-
     Log("device found %p", (void*)g_dev);
-    D3DDEVICE_CREATION_PARAMETERS cp = {};
-    if (SUCCEEDED(g_dev->GetCreationParameters(&cp))) g_hwnd = cp.hFocusWindow;
-    if (!g_hwnd) g_hwnd = GetForegroundWindow();
+    Sleep(3000);                                    // let the game finish creating its device
 
-    LoadIni();
-    LoadTxd();
-    Log("txd textures loaded: %d (gta6menu.txd at %s)", (int)g_tex.size(), FindModFile("gta6menu.txd").c_str());
-    Log("map script '%s' found=%d key=0x%X", g_mapScript.c_str(), MapScriptFound() ? 1 : 0, g_mapKey);
-
+    // only patches a vtable slot (plain memory write) — no Direct3D calls from this thread
     void** vtbl = *reinterpret_cast<void***>(g_dev);
     DWORD old = 0;
     if (VirtualProtect(&vtbl[42], sizeof(void*), PAGE_READWRITE, &old)) {
@@ -989,8 +998,7 @@ static DWORD WINAPI InitThread(LPVOID)
         vtbl[42] = reinterpret_cast<void*>(&HookedEndScene);
         VirtualProtect(&vtbl[42], sizeof(void*), old, &old);
     }
-    Log("EndScene hooked=%d hwnd=%p", g_origEndScene ? 1 : 0, (void*)g_hwnd);
-    if (g_hwnd) g_oldProc = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(g_hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(&HookedWndProc)));
+    Log("EndScene hooked=%d", g_origEndScene ? 1 : 0);
     return 0;
 }
 
