@@ -33,15 +33,12 @@ static int g_mx = 0, g_my = 0;           // client coords
 static bool g_down = false, g_click = false, g_keyQ = false, g_keyE = false;
 static int g_page = 0;                   // 0 main, 1 settings, 2 MoonLoader scripts, 3 Mod Loader mods
 static bool g_stockMode = false;         // a stock page is being shown (overlay hidden)
-static int g_stockReturn = 0;
 static bool g_escWas = false;
-static int g_ignoreEsc = 0;              // our own synthetic ESC presses
 static bool g_wasActive = false;
+static bool g_overlayVisible = false;    // overlay is drawn: swallow mouse so the stock menu can't see it
 static int g_spage = 0;                  // list page (scripts / mods)
 static int g_stab = 0;                   // settings tab
 static int g_lastHover = 0;
-// where the stock menu currently is: 0 main, 1 options, 2 options sub-page, 3 map
-static int g_loc = 0, g_mainIdx = 0, g_optIdx = 0;
 
 // config (gta6menu.ini)
 static int g_accent = 0;                 // 0..3
@@ -205,8 +202,8 @@ static void Ring(float cx, float cy, float r, float th, DWORD c)
 // ---- text: GDI renders into a texture, cached per (font, string) ----
 struct TextTex { IDirect3DTexture9* tex; int w, h; };
 static std::unordered_map<std::string, TextTex> g_text;
-static HFONT g_fonts[4] = {};   // 0 small, 1 regular, 2 big, 3 huge
-static int g_fontPx[4] = { 22, 28, 44, 92 };
+static HFONT g_fonts[5] = {};   // 0 small, 1 regular, 2 big, 3 huge, 4 title
+static int g_fontPx[5] = { 22, 28, 44, 92, 36 };
 static float g_fontScale = 0;
 
 static void ClearText()
@@ -218,7 +215,7 @@ static void EnsureFonts()
 {
     if (g_fontScale == S) return;
     ClearText();
-    for (int i = 0; i < 4; ++i)
+    for (int i = 0; i < 5; ++i)
     {
         if (g_fonts[i]) DeleteObject(g_fonts[i]);
         g_fonts[i] = CreateFontA(-(int)(g_fontPx[i] * S + 0.5f), 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
@@ -413,55 +410,72 @@ static void PumpKeys()
     g_evDelay = e.kind ? 1 : 3;
 }
 
-// ----------------------------------------------- stock menu navigation ---
-static void StockMove(int from, int to)
+// ----------------------------------------------- stock menu automation ---
+// The stock pause menu stays alive under the overlay, so we never trust remembered highlight
+// positions. Every stock page is reached from a known state: close the stock menu completely,
+// reopen it (cursor on "Resume"), then press DOWN/ENTER. While the overlay is shown the stock
+// menu is "parked" on the Brief page, which has nothing clickable except its own BACK.
+enum { S_KEY, S_WAIT, S_CLOSE, S_OPEN, S_STOCKMODE, S_VK };
+struct Step { int kind; int a; int b; int c; };
+static std::vector<Step> g_steps;
+static int g_stepWait = 0, g_stepTries = 0;
+
+static void AddKey(int scan, bool ext, int count = 1) { g_steps.push_back({ S_KEY, scan, ext ? 1 : 0, count }); }
+static void AddWait(int frames) { g_steps.push_back({ S_WAIT, frames, 0, 0 }); }
+static void AddReset() { g_steps.push_back({ S_CLOSE, 0, 0, 0 }); AddWait(8); g_steps.push_back({ S_OPEN, 0, 0, 0 }); AddWait(14); }
+static void AddPark() { AddKey(0x50, true, 4); AddKey(0x1C, false); AddWait(6); }     // DOWN x4, ENTER => Brief page
+static void AddStockMode(bool on) { g_steps.push_back({ S_STOCKMODE, on ? 1 : 0, 0, 0 }); }
+static bool Busy() { return !g_steps.empty() || !g_evq.empty() || g_evDelay > 0; }
+
+static void RunSteps(bool active)
 {
-    int d = to - from;
-    for (int i = 0; i < std::abs(d); ++i) PushKey(d > 0 ? 0x50 : 0x48, true);   // DOWN / UP arrow
-}
-static void StockResume() { PushKey(0x01, false); }
-// every non-main overlay page parks the stock menu on its Options page, so ESC steps back one level
-static void EnterPage(int page)
-{
-    if (g_loc == 0) {
-        StockMove(g_mainIdx, g_navOptions);
-        g_mainIdx = g_navOptions;
-        PushKey(0x1C, false);                              // ENTER
-        g_loc = 1; g_optIdx = 0;
+    if (!g_evq.empty() || g_evDelay > 0) return;
+    if (g_stepWait > 0) { --g_stepWait; return; }
+    if (g_steps.empty()) return;
+    Step s = g_steps.front();
+    switch (s.kind) {
+    case S_KEY:  for (int i = 0; i < s.c; ++i) PushKey((WORD)s.a, s.b != 0); g_steps.erase(g_steps.begin()); break;
+    case S_WAIT: g_stepWait = s.a; g_steps.erase(g_steps.begin()); break;
+    case S_CLOSE:
+        if (!active || ++g_stepTries > 8) { g_stepTries = 0; g_steps.erase(g_steps.begin()); }
+        else { PushKey(0x01, false); g_stepWait = 10; }
+        break;
+    case S_OPEN:
+        if (active || ++g_stepTries > 6) { g_stepTries = 0; g_steps.erase(g_steps.begin()); }
+        else { PushKey(0x01, false); g_stepWait = 20; }
+        break;
+    case S_STOCKMODE: g_stockMode = s.a != 0; g_steps.erase(g_steps.begin()); break;
+    case S_VK:   PushVk((WORD)s.a); g_steps.erase(g_steps.begin()); break;
+    default:     g_steps.erase(g_steps.begin()); break;
     }
-    g_page = page;
-    g_spage = 0;
 }
-static void LeavePage()
-{
-    if (g_loc == 1) { PushKey(0x01, false); g_ignoreEsc = 1; g_loc = 0; }
-    g_page = 0;
-}
+
+static void StockResume() { g_steps.clear(); AddKey(0x01, false); AddWait(8); AddKey(0x01, false); }   // Brief -> main -> resume
+static void ReturnToOverlay() { g_steps.clear(); AddStockMode(false); AddReset(); AddPark(); }
 static void OpenOptionsCategory(int k)
 {
-    StockMove(g_optIdx, k);
-    g_optIdx = k;
-    PushKey(0x1C, false);
-    g_loc = 2;
-    g_stockMode = true;
-    g_stockReturn = 0;
+    g_steps.clear();
+    AddStockMode(true);
+    AddReset();
+    AddKey(0x50, true, g_navOptions); AddKey(0x1C, false);   // Options
+    AddWait(10);
+    if (k > 0) AddKey(0x50, true, k);
+    AddKey(0x1C, false);                                   // chosen category
 }
 static void OpenStockMap()
 {
-    StockMove(g_mainIdx, g_navMap);
-    g_mainIdx = g_navMap;
-    PushKey(0x1C, false);
-    g_loc = 3;
-    g_stockMode = true;
-    g_stockReturn = 0;
+    g_steps.clear();
+    AddStockMode(true);
+    AddReset();
+    AddKey(0x50, true, g_navMap); AddKey(0x1C, false);
 }
 static bool MapScriptFound() { return !g_mapScript.empty() && FileExists(GameDir() + "moonloader\\" + g_mapScript); }
 static void DoMap()
 {
     if (MapScriptFound()) {            // use the Lua big map: close the pause menu, then press its key
         StockResume();
-        PushWait(40);
-        PushVk((WORD)g_mapKey);
+        AddWait(30);
+        g_steps.push_back({ S_VK, g_mapKey, 0, 0 });
     } else OpenStockMap();
 }
 static void ReloadMoonLoader()
@@ -591,7 +605,7 @@ static void BackHints(bool click, const char* pageLabel)
     float hx = W - 50 * S, hy = H - 62 * S - 17 * S;
     float bw = TextW(0, "ESC") + 22 * S, lw = TextW(0, "BACK");
     float backX = hx - bw - 12 * S - lw;
-    if (click && Hit(backX, hy, bw + 12 * S + lw, 34 * S, (float)g_mx, (float)g_my)) LeavePage();
+    if (click && Hit(backX, hy, bw + 12 * S + lw, 34 * S, (float)g_mx, (float)g_my)) g_page = 0;
     KeyCap(hx, hy, "ESC", "BACK", 34 * S);
     KeyCap(hx, hy, "Q E", pageLabel, 34 * S);
 }
@@ -624,9 +638,9 @@ static void DrawMainPage(bool click)
         if (hov && click) {
             if (i == 0) StockResume();
             else if (i == 1) DoMap();
-            else if (i == 2) { EnterPage(1); g_stab = 0; }
-            else if (i == 3) { ScanScripts(); EnterPage(2); }
-            else { ScanMods(); EnterPage(3); }
+            else if (i == 2) { g_page = 1; g_stab = 0; g_spage = 0; }
+            else if (i == 3) { ScanScripts(); g_page = 2; g_spage = 0; }
+            else { ScanMods(); g_page = 3; g_spage = 0; }
         }
         DWORD fg = hov ? INK : WHITE;
         if (hov) {
@@ -713,7 +727,7 @@ static void DrawSettingsPage(bool click, bool keyQ, bool keyE)
     DrawPurpleBackground();
     if (keyQ || keyE) g_stab = (g_stab + 1) % 2;
 
-    Text(2, 32 * S, 22 * S, WHITE, "SETTINGS");
+    Text(4, 32 * S, 20 * S, WHITE, "SETTINGS");
     float tx = 32 * S;
     for (int i = 0; i < 2; ++i) {
         float tw = TextW(0, kSettingsTabs[i]) + 40 * S, th = 38 * S, ty = 78 * S;
@@ -751,7 +765,7 @@ static void DrawListPage(int mode, bool click, bool keyQ, bool keyE)
 {
     DrawPurpleBackground();
     const bool scripts = (mode == 2);
-    Text(2, 32 * S, 22 * S, WHITE, scripts ? "MOONLOADER" : "MOD LOADER");
+    Text(4, 32 * S, 20 * S, WHITE, scripts ? "MOONLOADER" : "MOD LOADER");
     bool found = scripts ? g_moonFound : g_modLoaderFound;
     const char* status = scripts ? (found ? "MoonLoader detected" : "MoonLoader not detected (moonloader.asi not loaded)")
                                  : (found ? "Mod Loader detected" : "Mod Loader not detected (no modloader folder)");
@@ -830,26 +844,27 @@ static void Frame()
 {
     PumpKeys();                                     // keeps running after the menu closes (Lua map key)
     bool active = *kMenuActive == 1;
+    RunSteps(active);
+
     if (!active) {
-        if (g_wasActive) { g_page = 0; g_stockMode = false; g_stockReturn = 0; g_loc = 0; g_mainIdx = 0; g_optIdx = 0; g_ignoreEsc = 0; }
-        g_wasActive = false;
+        g_overlayVisible = false;
+        if (g_wasActive && !Busy()) { g_wasActive = false; g_page = 0; g_stockMode = false; g_steps.clear(); }
         g_click = false;
         return;
     }
-    g_wasActive = true;
+    if (!g_wasActive) {                             // fresh open: park the stock menu on an inert page
+        g_wasActive = true;
+        g_page = 0; g_stockMode = false; g_steps.clear();
+        AddWait(3); AddPark();
+    }
 
-    // ESC tracking: keeps our idea of the stock page in sync and brings the overlay back
+    // physical ESC (ours are ignored while busy)
     bool esc = (GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0;
-    if (esc && !g_escWas) {
-        if (g_ignoreEsc > 0) --g_ignoreEsc;
-        else if (g_stockMode) {
-            if (g_loc == 2) g_loc = 1; else if (g_loc == 3) g_loc = 0;
-            g_stockReturn = 14;
-        }
-        else if (g_page != 0 && g_loc == 1) { g_loc = 0; g_page = 0; }
+    if (esc && !g_escWas && !Busy() && !g_stockMode) {
+        if (g_page != 0) { g_page = 0; g_steps.clear(); AddReset(); AddPark(); }   // back to our main page
+        else { AddWait(2); AddKey(0x01, false); }                                  // stock is on its main page: resume
     }
     g_escWas = esc;
-    if (g_stockMode && g_stockReturn > 0 && --g_stockReturn == 0) g_stockMode = false;
 
     D3DVIEWPORT9 vp;
     if (FAILED(g_dev->GetViewport(&vp)) || vp.Width < 320) return;
@@ -863,6 +878,7 @@ static void Frame()
 
     bool click = g_click, keyQ = g_keyQ, keyE = g_keyE;
     g_click = g_keyQ = g_keyE = false;
+    g_overlayVisible = !g_stockMode;
 
     EnsureFonts();
     IDirect3DStateBlock9* sb = nullptr;
@@ -870,10 +886,12 @@ static void Frame()
     SetupState();
 
     if (g_stockMode) {
-        const char* msg = "Press ESC to return to the GTA 6 menu";
-        float tw = TextW(0, msg) + 48 * S, th = 44 * S;
-        Rect((W - tw) * 0.5f, H - 90 * S, tw, th, 0xB4141028);
-        TextC(0, (W - tw) * 0.5f, H - 90 * S, tw, th, WHITE, msg);
+        const char* msg = "Click here to return to the GTA 6 menu";
+        float tw = TextW(0, msg) + 48 * S, th = 44 * S, px = (W - tw) * 0.5f, py = H - 90 * S;
+        bool hov = Hit(px, py, tw, th, (float)g_mx, (float)g_my);
+        Rect(px, py, tw, th, hov ? 0xFFFFFFFF : 0xC8141028);
+        TextC(0, px, py, tw, th, hov ? INK : WHITE, msg);
+        if (hov && click && !Busy()) ReturnToOverlay();
     } else {
         if (g_page == 1) DrawSettingsPage(click, keyQ, keyE);
         else if (g_page == 2 || g_page == 3) DrawListPage(g_page, click, keyQ, keyE);
@@ -916,6 +934,7 @@ static LRESULT CALLBACK HookedWndProc(HWND h, UINT m, WPARAM w, LPARAM l)
     case WM_KEYDOWN: if (w == 'Q') g_keyQ = true; if (w == 'E') g_keyE = true; break;
     default: break;
     }
+    if (g_overlayVisible && m >= 0x200 && m <= 0x20E) return 0;     // mouse messages: overlay only
     return CallWindowProcW(g_oldProc, h, m, w, l);
 }
 

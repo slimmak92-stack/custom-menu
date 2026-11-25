@@ -26,3 +26,11 @@ gta6menu.ini (created next to the .asi):
 
 Custom textures: assets/gta6menu.txd (RenderWare TXD, editable in Magic.TXD).
 Regenerate from tools/src/*.png with:  python3 tools/make_txd.py
+
+How the stock-menu part works (v3)
+  The stock pause menu stays alive under the overlay, so the overlay "parks" it on the Brief page
+  (an inert page) and swallows mouse input. Opening a stock page (Map, Controller/Audio/Display/
+  Language/Mod configuration) closes the stock menu, reopens it fresh (cursor on Resume) and presses
+  DOWN/ENTER from there, so it never depends on a remembered highlight.
+  Inside a stock page use the pill at the bottom ("Click here to return to the GTA 6 menu").
+  ESC on an overlay page = back, ESC on the main page = resume.
