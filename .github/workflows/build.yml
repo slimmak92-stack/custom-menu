@@ -1,0 +1,23 @@
+name: Build gta6menu.asi
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure (Win32)
+        run: cmake -S . -B build -A Win32
+      - name: Build
+        run: cmake --build build --config Release
+      - name: Collect
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force out | Out-Null
+          Get-ChildItem -Recurse build -Filter gta6menu.asi | Copy-Item -Destination out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gta6menu-asi
+          path: out/gta6menu.asi
