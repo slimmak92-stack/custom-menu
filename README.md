@@ -46,3 +46,12 @@ Audio/graphics notes
   Brightness/vignette/tint are drawn over the finished frame while you play (not in menus).
   FPS cap only lowers the frame rate (it can't exceed the game's own limiter).
   Settings are saved to gta6menu.ini ([audio] [graphics]).
+
+Real game settings (v4)
+  Settings now read and write the ORIGINAL game settings live (sound effects / radio volume, radio EQ,
+  radio auto-select, brightness, draw distance, frame limiter, mip mapping, widescreen, HUD, radar mode,
+  subtitles) -- the same fields the original menu uses, so they show up in the stock pages too and are
+  saved the same way. The field offsets are generated at build time from plugin-sdk
+  (tools/offsets.cpp + tools/gen_offsets.ps1 -> src/menu_offsets.h). If a field can't be found the row
+  shows "Unavailable" instead of doing anything unsafe. The build artifact includes menu_offsets.h so
+  you can see what was found.
