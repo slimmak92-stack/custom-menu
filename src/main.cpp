@@ -7,6 +7,9 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#include <objbase.h>
+#include <mmdeviceapi.h>
+#include <audiopolicy.h>
 #include <d3d9.h>
 #include <cmath>
 #include <cstdlib>
@@ -48,12 +51,22 @@ static int g_h24 = 1;
 static int g_showFps = 0;
 static int g_navMap = 2;                 // DOWN presses from "Resume" to reach "Map"
 static int g_navOptions = 5;             // DOWN presses from "Resume" to reach "Options"
+static int g_volume = 100;               // game master volume 0..100 (Windows audio session)
+static int g_mute = 0;
+static int g_bright = 0;                 // -50..50  (overlay)
+static int g_vignette = 0;               // 0..100
+static int g_tint = 0;                   // 0 off, 1 warm, 2 cool
+static int g_fpsCap = 0;                 // index into kFpsValues
+static volatile LONG g_audioDirty = 0;
 static int g_mapKey = 0x12;              // key that opens the Lua big map (ALT)
 static std::string g_mapScript = "gps_zone_hud.lua";
 
 static const DWORD kAccents[4] = { 0xFFF2539C, 0xFF40D0FF, 0xFFFF963C, 0xFF5ADC82 };
 static const char* const kAccentNames[4] = { "Pink", "Cyan", "Orange", "Green" };
 static const char* const kBgNames[3] = { "Dusk", "Night", "Sunset" };
+static const char* const kTintNames[3] = { "Off", "Warm", "Cool" };
+static const char* const kFpsNames[6] = { "Off", "30", "60", "90", "120", "144" };
+static const int kFpsValues[6] = { 0, 30, 60, 90, 120, 144 };
 
 // ----------------------------------------------------------------- ini ---
 static std::string IniPath()
@@ -89,6 +102,13 @@ static void LoadIni()
     g_bg = std::min(2, std::max(0, (int)GetPrivateProfileIntA("menu", "background", 0, p.c_str())));
     g_h24 = GetPrivateProfileIntA("menu", "clock24", 1, p.c_str()) ? 1 : 0;
     g_showFps = GetPrivateProfileIntA("menu", "showfps", 0, p.c_str()) ? 1 : 0;
+    g_volume = std::min(100, std::max(0, (int)GetPrivateProfileIntA("audio", "volume", 100, p.c_str())));
+    g_mute = GetPrivateProfileIntA("audio", "mute", 0, p.c_str()) ? 1 : 0;
+    g_bright = std::min(50, std::max(-50, (int)GetPrivateProfileIntA("graphics", "brightness", 0, p.c_str())));
+    g_vignette = std::min(100, std::max(0, (int)GetPrivateProfileIntA("graphics", "vignette", 0, p.c_str())));
+    g_tint = std::min(2, std::max(0, (int)GetPrivateProfileIntA("graphics", "tint", 0, p.c_str())));
+    g_fpsCap = std::min(5, std::max(0, (int)GetPrivateProfileIntA("graphics", "fpscap", 0, p.c_str())));
+    if (g_volume != 100 || g_mute) g_audioDirty = 1;
     g_mapKey = std::min(255, std::max(1, (int)GetPrivateProfileIntA("map", "key", 0x12, p.c_str())));
     { char b[64] = {}; GetPrivateProfileStringA("map", "script", "gps_zone_hud.lua", b, 64, p.c_str()); g_mapScript = b; }
     g_navMap = std::min(12, std::max(0, (int)GetPrivateProfileIntA("stock", "nav_map", 2, p.c_str())));
@@ -102,6 +122,12 @@ static void SaveIni()
     sprintf(b, "%d", g_bg);      WritePrivateProfileStringA("menu", "background", b, p.c_str());
     sprintf(b, "%d", g_h24);     WritePrivateProfileStringA("menu", "clock24", b, p.c_str());
     sprintf(b, "%d", g_showFps); WritePrivateProfileStringA("menu", "showfps", b, p.c_str());
+    sprintf(b, "%d", g_volume);  WritePrivateProfileStringA("audio", "volume", b, p.c_str());
+    sprintf(b, "%d", g_mute);    WritePrivateProfileStringA("audio", "mute", b, p.c_str());
+    sprintf(b, "%d", g_bright);  WritePrivateProfileStringA("graphics", "brightness", b, p.c_str());
+    sprintf(b, "%d", g_vignette); WritePrivateProfileStringA("graphics", "vignette", b, p.c_str());
+    sprintf(b, "%d", g_tint);    WritePrivateProfileStringA("graphics", "tint", b, p.c_str());
+    sprintf(b, "%d", g_fpsCap);  WritePrivateProfileStringA("graphics", "fpscap", b, p.c_str());
     sprintf(b, "%d", g_mapKey);  WritePrivateProfileStringA("map", "key", b, p.c_str());
     WritePrivateProfileStringA("map", "script", g_mapScript.c_str(), p.c_str());
     sprintf(b, "%d", g_navMap);  WritePrivateProfileStringA("stock", "nav_map", b, p.c_str());
@@ -412,8 +438,8 @@ static void PushVk(WORD vk) { WORD sc = (WORD)MapVirtualKeyA(vk, 0); g_evq.push_
 static void PushWait(int frames) { g_evq.push_back({ (WORD)frames, 0, false, 2 }); }
 static void PumpKeys()
 {
-    if (g_evq.empty()) return;
     if (g_evDelay > 0) { --g_evDelay; return; }
+    if (g_evq.empty()) return;
     KeyEv e = g_evq.front();
     g_evq.erase(g_evq.begin());
     if (e.kind == 2) { g_evDelay = e.scan; return; }
@@ -680,22 +706,35 @@ static void DrawMainPage(bool click)
     KeyCap(hx, hy, "ENTER", "SELECT", 34 * S);
 }
 
-// ---- settings page: stock categories (skinned) + this menu's own settings ----
+// ---- settings page: real audio/graphics controls + skinned stock pages + this menu ----
 struct Setting { int tab; int kind; const char* label; const char* desc; int* val; int mn, mx; const char* const* opts; int link; };
-// kinds: 0 toggle, 2 cycle, 3 action, 4 link to a stock Options sub-page
+// kinds: 0 toggle, 1 slider, 2 cycle, 3 action, 4 link to a stock Options sub-page
 static Setting g_settings[] = {
-    { 0, 4, "Controller setup", "Open the original controller setup: mouse, keyboard and gamepad options.", nullptr, 0, 0, nullptr, 0 },
-    { 0, 4, "Audio setup", "Open the original audio setup: volumes, radio and equaliser.", nullptr, 0, 0, nullptr, 1 },
-    { 0, 4, "Display setup", "Open the original display setup: brightness, resolution, anti-aliasing and the HUD.", nullptr, 0, 0, nullptr, 2 },
-    { 0, 4, "Language", "Open the original language page.", nullptr, 0, 0, nullptr, 3 },
-    { 0, 4, "Mod configuration", "Open the mod configuration page added by your mods.", nullptr, 0, 0, nullptr, 4 },
-    { 1, 2, "Accent colour", "Colour of the clock, toggles and highlights in this menu.", &g_accent, 0, 3, kAccentNames, 0 },
-    { 1, 2, "Background", "Backdrop gradient shown behind the main page.", &g_bg, 0, 2, kBgNames, 0 },
-    { 1, 0, "24-hour clock", "Show the clock in 24-hour format instead of AM/PM.", &g_h24, 0, 1, nullptr, 0 },
-    { 1, 0, "Show FPS", "Show the frame rate in the top-left corner.", &g_showFps, 0, 1, nullptr, 0 },
-    { 1, 3, "Restore defaults", "Reset this menu's own settings to their defaults.", nullptr, 0, 0, nullptr, 0 },
+    // AUDIO
+    { 0, 1, "Master volume", "Volume of the whole game (all sound, radio and voice). Uses the Windows volume mixer entry of the game.", &g_volume, 0, 100, nullptr, 0 },
+    { 0, 0, "Mute game", "Silence all game audio without changing the volume.", &g_mute, 0, 1, nullptr, 0 },
+    { 0, 4, "Audio setup (original)", "Sound effects volume, radio volume, radio equaliser and auto-retune from the original game page.", nullptr, 0, 0, nullptr, 1 },
+    // GRAPHICS
+    { 1, 1, "Brightness", "Lightens or darkens the whole picture while you play.", &g_bright, -50, 50, nullptr, 0 },
+    { 1, 1, "Vignette", "Darkens the edges of the screen for a cinematic look.", &g_vignette, 0, 100, nullptr, 0 },
+    { 1, 2, "Colour tint", "Warm gives a sunset feel, cool a night feel.", &g_tint, 0, 2, kTintNames, 0 },
+    { 1, 2, "FPS cap", "Limits the frame rate. Lower values save power and can make frame pacing smoother.", &g_fpsCap, 0, 5, kFpsNames, 0 },
+    { 1, 4, "Display setup (original)", "Resolution, anti-aliasing, draw distance, frame limiter and HUD options from the original game page.", nullptr, 0, 0, nullptr, 2 },
+    // GAME OPTIONS
+    { 2, 4, "Controller setup", "Open the original controller setup: mouse, keyboard and gamepad options.", nullptr, 0, 0, nullptr, 0 },
+    { 2, 4, "Language", "Open the original language page.", nullptr, 0, 0, nullptr, 3 },
+    { 2, 4, "Mod configuration", "Open the mod configuration page added by your mods.", nullptr, 0, 0, nullptr, 4 },
+    // THIS MENU
+    { 3, 2, "Accent colour", "Colour of the clock, toggles and highlights in this menu.", &g_accent, 0, 3, kAccentNames, 0 },
+    { 3, 2, "Background", "Backdrop gradient shown behind the main page.", &g_bg, 0, 2, kBgNames, 0 },
+    { 3, 0, "24-hour clock", "Show the clock in 24-hour format instead of AM/PM.", &g_h24, 0, 1, nullptr, 0 },
+    { 3, 0, "Show FPS", "Show the frame rate in the top-left corner.", &g_showFps, 0, 1, nullptr, 0 },
+    { 3, 3, "Restore defaults", "Reset every setting on these pages to its default.", nullptr, 0, 0, nullptr, 0 },
 };
-static const char* const kSettingsTabs[2] = { "GAME OPTIONS", "THIS MENU" };
+static const char* const kSettingsTabs[4] = { "AUDIO", "GRAPHICS", "GAME OPTIONS", "THIS MENU" };
+static int g_dragIdx = -1;
+
+static void Changed() { InterlockedExchange(&g_audioDirty, 1); }
 
 static void DrawSettingRow(int idx, const Setting& s, float x, float y, float w, float h, bool click, int& hoverRow)
 {
@@ -711,14 +750,35 @@ static void DrawSettingRow(int idx, const Setting& s, float x, float y, float w,
         Line(rx, cy, rx - a, cy + a, 3 * S, fg);
         if (hov && click) OpenOptionsCategory(s.link);
     } else if (s.kind == 3) {
-        if (hov && click) { g_accent = 0; g_bg = 0; g_h24 = 1; g_showFps = 0; SaveIni(); }
+        if (hov && click) {
+            g_accent = 0; g_bg = 0; g_h24 = 1; g_showFps = 0;
+            g_volume = 100; g_mute = 0; g_bright = 0; g_vignette = 0; g_tint = 0; g_fpsCap = 0;
+            Changed(); SaveIni();
+        }
     } else if (s.kind == 0) {
-        if (hov && click) { *s.val = !*s.val; SaveIni(); }
+        if (hov && click) { *s.val = !*s.val; Changed(); SaveIni(); }
         bool on = *s.val != 0;
         float pw = 84 * S, ph = 34 * S, px = rx - pw, py = y + (h - ph) * 0.5f;
         Pill(px, py, pw, ph, on ? kAccents[g_accent] : (hov ? 0x64000000 : 0x64FFFFFF));
         Circle(on ? px + pw - ph * 0.5f : px + ph * 0.5f, py + ph * 0.5f, ph * 0.5f - 4 * S, WHITE);
         TextR(1, px - 16 * S, ty, fg, on ? "On" : "Off");
+    } else if (s.kind == 1) {
+        float tw = 240 * S, tr = rx - 90 * S, tl = tr - tw, cy = y + h * 0.5f;
+        if (hov && click && Hit(tl - 24 * S, y, tw + 48 * S, h, (float)g_mx, (float)g_my)) g_dragIdx = idx;
+        if (g_dragIdx == idx) {
+            if (g_down) {
+                float t = std::min(1.0f, std::max(0.0f, ((float)g_mx - tl) / tw));
+                int nv = s.mn + (int)(t * (s.mx - s.mn) + 0.5f);
+                if (nv != *s.val) { *s.val = nv; Changed(); }
+            } else { g_dragIdx = -1; SaveIni(); }
+        }
+        float t = (float)(*s.val - s.mn) / (float)(s.mx - s.mn);
+        Rect(tl, cy - 2 * S, tw, 4 * S, hov ? 0x6E000000 : 0x6EFFFFFF);
+        Rect(tl, cy - 2 * S, tw * t, 4 * S, kAccents[g_accent]);
+        Rect(tl + tw * t - 3 * S, cy - 11 * S, 6 * S, 22 * S, kAccents[g_accent]);
+        char num[16];
+        if (s.mn < 0) sprintf(num, "%+d", *s.val); else sprintf(num, "%d", *s.val);
+        TextR(1, rx, ty, fg, num);
     } else if (s.kind == 2) {
         int n = s.mx - s.mn + 1;
         const char* label = s.opts[*s.val];
@@ -728,7 +788,7 @@ static void DrawSettingRow(int idx, const Setting& s, float x, float y, float w,
             int dir = 1;
             if ((float)g_mx >= cl && (float)g_mx <= cr && (float)g_mx < (cl + cr) * 0.5f) dir = -1;
             *s.val = ((*s.val - s.mn + dir) % n + n) % n + s.mn;
-            SaveIni();
+            Changed(); SaveIni();
             label = s.opts[*s.val];
         }
         Text(1, cl + aw + 14 * S, ty, fg, label);
@@ -743,11 +803,12 @@ static void DrawSettingRow(int idx, const Setting& s, float x, float y, float w,
 static void DrawSettingsPage(bool click, bool keyQ, bool keyE)
 {
     DrawPurpleBackground();
-    if (keyQ || keyE) g_stab = (g_stab + 1) % 2;
+    if (keyQ) g_stab = (g_stab + 3) % 4;
+    if (keyE) g_stab = (g_stab + 1) % 4;
 
     Text(4, 32 * S, 20 * S, WHITE, "SETTINGS");
     float tx = 32 * S;
-    for (int i = 0; i < 2; ++i) {
+    for (int i = 0; i < 4; ++i) {
         float tw = TextW(0, kSettingsTabs[i]) + 40 * S, th = 38 * S, ty = 78 * S;
         bool hov = Hit(tx, ty, tw, th, (float)g_mx, (float)g_my);
         if (hov && click) g_stab = i;
@@ -769,11 +830,13 @@ static void DrawSettingsPage(bool click, bool keyQ, bool keyE)
     }
     const Setting* shown = &g_settings[hoverRow >= 0 ? hoverRow : (firstIdx >= 0 ? firstIdx : 0)];
     float dx = 1178 * S;
-    Text(2, dx, 150 * S, WHITE, Upper(shown->label).c_str());
+    std::string title = Upper(shown->label);
+    if (TextW(2, title.c_str()) > 640 * S) title = title.substr(0, 16) + "...";
+    Text(2, dx, 150 * S, WHITE, title.c_str());
     Rect(dx, 216 * S, 640 * S, 2 * S, 0x5AFFFFFF);
     WrapText(dx, 238 * S, 640 * S, 0xE6FFFFFF, shown->desc);
 
-    char pg[16]; sprintf(pg, "%d / 2", g_stab + 1);
+    char pg[16]; sprintf(pg, "%d / 4", g_stab + 1);
     Text(1, 48 * S, H - 150 * S, WHITE, pg);
     BackHints(click, "TABS");
 }
@@ -858,6 +921,8 @@ static void DrawCursor()
     g_dev->DrawPrimitiveUP(D3DPT_TRIANGLELIST, 1, v, sizeof(Vtx));
 }
 
+static void DrawFx(IDirect3DDevice9* dev);
+
 static void Frame()
 {
     PumpKeys();                                     // keeps running after the menu closes (Lua map key)
@@ -868,6 +933,7 @@ static void Frame()
     if ((int)active != lastActive) { Log("stock menu active=%d page=%d stockMode=%d busy=%d", active ? 1 : 0, g_page, g_stockMode ? 1 : 0, Busy() ? 1 : 0); lastActive = active ? 1 : 0; }
     if (!active) {
         g_overlayVisible = false;
+        DrawFx(g_dev);
         if (g_wasActive && !Busy()) { g_wasActive = false; g_page = 0; g_stockMode = false; g_steps.clear(); }
         g_click = false;
         return;
@@ -932,6 +998,102 @@ static void Frame()
     g_mx = rawX; g_my = rawY;
 }
 
+// ------------------------------------------------- audio (Windows session) ---
+// Sets the volume of this game's own entry in the Windows volume mixer.
+static void ApplyAudioOnce()
+{
+    IMMDeviceEnumerator* en = nullptr;
+    if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, __uuidof(IMMDeviceEnumerator), (void**)&en)) || !en) return;
+    IMMDevice* dev = nullptr;
+    if (SUCCEEDED(en->GetDefaultAudioEndpoint(eRender, eMultimedia, &dev)) && dev) {
+        IAudioSessionManager2* mgr = nullptr;
+        if (SUCCEEDED(dev->Activate(__uuidof(IAudioSessionManager2), CLSCTX_ALL, nullptr, (void**)&mgr)) && mgr) {
+            IAudioSessionEnumerator* se = nullptr;
+            if (SUCCEEDED(mgr->GetSessionEnumerator(&se)) && se) {
+                int n = 0;
+                se->GetCount(&n);
+                for (int i = 0; i < n; ++i) {
+                    IAudioSessionControl* c = nullptr;
+                    if (FAILED(se->GetSession(i, &c)) || !c) continue;
+                    IAudioSessionControl2* c2 = nullptr;
+                    if (SUCCEEDED(c->QueryInterface(__uuidof(IAudioSessionControl2), (void**)&c2)) && c2) {
+                        DWORD pid = 0;
+                        c2->GetProcessId(&pid);
+                        if (pid == GetCurrentProcessId()) {
+                            ISimpleAudioVolume* sv = nullptr;
+                            if (SUCCEEDED(c->QueryInterface(__uuidof(ISimpleAudioVolume), (void**)&sv)) && sv) {
+                                sv->SetMasterVolume(g_volume / 100.0f, nullptr);
+                                sv->SetMute(g_mute ? TRUE : FALSE, nullptr);
+                                sv->Release();
+                            }
+                        }
+                        c2->Release();
+                    }
+                    c->Release();
+                }
+                se->Release();
+            }
+            mgr->Release();
+        }
+        dev->Release();
+    }
+    en->Release();
+}
+static DWORD WINAPI AudioThread(LPVOID)
+{
+    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    int tick = 0;
+    for (;;) {
+        Sleep(250);
+        bool nonDefault = g_volume != 100 || g_mute;
+        if (InterlockedExchange(&g_audioDirty, 0) || (nonDefault && ++tick % 12 == 0)) ApplyAudioOnce();   // re-apply: the session can appear late
+    }
+    return 0;
+}
+
+// ------------------------------------------- in-game picture adjustments ---
+// Drawn on top of the finished frame (not while the pause menu is open).
+static void DrawFx(IDirect3DDevice9* dev)
+{
+    if (!g_bright && !g_vignette && !g_tint) return;
+    D3DVIEWPORT9 vp;
+    if (FAILED(dev->GetViewport(&vp)) || vp.Width < 320) return;
+    float w = (float)vp.Width, h = (float)vp.Height;
+    IDirect3DStateBlock9* sb = nullptr;
+    if (FAILED(dev->CreateStateBlock(D3DSBT_ALL, &sb)) || !sb) return;
+    SetupState();
+    if (g_bright > 0) Rect(0, 0, w, h, RGBA(255, 255, 255, (int)(g_bright * 1.8f)));
+    else if (g_bright < 0) Rect(0, 0, w, h, RGBA(0, 0, 0, (int)(-g_bright * 2.4f)));
+    if (g_tint == 1) Rect(0, 0, w, h, RGBA(255, 150, 60, 34));
+    else if (g_tint == 2) Rect(0, 0, w, h, RGBA(60, 140, 255, 34));
+    if (g_vignette > 0) {
+        int a = std::min(235, (int)(g_vignette * 2.35f));
+        float e = 0.30f;
+        GradH(0, 0, w * e, h, RGBA(0, 0, 0, a), RGBA(0, 0, 0, 0));
+        GradH(w * (1 - e), 0, w * e, h, RGBA(0, 0, 0, 0), RGBA(0, 0, 0, a));
+        GradV(0, 0, w, h * e, RGBA(0, 0, 0, a), RGBA(0, 0, 0, 0));
+        GradV(0, h * (1 - e), w, h * e, RGBA(0, 0, 0, 0), RGBA(0, 0, 0, a));
+    }
+    sb->Apply();
+    sb->Release();
+}
+
+static void LimitFps()
+{
+    int cap = kFpsValues[std::min(5, std::max(0, g_fpsCap))];
+    if (cap <= 0) return;
+    static LARGE_INTEGER freq = {}, last = {};
+    if (!freq.QuadPart) { QueryPerformanceFrequency(&freq); QueryPerformanceCounter(&last); return; }
+    double target = (double)freq.QuadPart / cap;
+    for (;;) {
+        LARGE_INTEGER now;
+        QueryPerformanceCounter(&now);
+        double el = (double)(now.QuadPart - last.QuadPart);
+        if (el >= target) { last = now; break; }
+        if ((target - el) * 1000.0 / (double)freq.QuadPart > 2.0) Sleep(1);
+    }
+}
+
 // ---------------------------------------------------------------- hooks ---
 static void InitOnRenderThread(IDirect3DDevice9* dev);
 static HRESULT WINAPI HookedEndScene(IDirect3DDevice9* dev)
@@ -946,6 +1108,9 @@ static HRESULT WINAPI HookedEndScene(IDirect3DDevice9* dev)
         if (rt) rt->Release();
         if (bb) bb->Release();
         if (onBack) Frame();
+        HRESULT r = g_origEndScene(dev);
+        if (onBack) LimitFps();
+        return r;
     }
     return g_origEndScene(dev);
 }
@@ -999,6 +1164,7 @@ static DWORD WINAPI InitThread(LPVOID)
         VirtualProtect(&vtbl[42], sizeof(void*), old, &old);
     }
     Log("EndScene hooked=%d", g_origEndScene ? 1 : 0);
+    CreateThread(nullptr, 0, AudioThread, nullptr, 0, nullptr);
     return 0;
 }
 

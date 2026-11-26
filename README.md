@@ -7,9 +7,12 @@ Press ESC: the GTA 6 style menu is drawn over the stock pause menu.
   Resume       -> native resume
   Map          -> if moonloader\gps_zone_hud.lua exists: closes the pause menu and presses its
                   big-map key (ALT); otherwise opens the stock Map page
-  Settings     -> GAME OPTIONS: Controller / Audio / Display / Language / Mod configuration
-                  (each opens the matching ORIGINAL stock page)  +  THIS MENU: accent, background,
-                  24h clock, FPS counter
+  Settings     -> AUDIO: master volume + mute (the game's Windows mixer volume)
+                  GRAPHICS: brightness, vignette, colour tint, FPS cap
+                  GAME OPTIONS: Controller / Language / Mod configuration (original stock pages)
+                  THIS MENU: accent, background, 24h clock, FPS counter
+                  (Audio/Display tabs also link to the original pages for SFX/radio volume,
+                   resolution, anti-aliasing, draw distance, ...)
   MoonLoader   -> lists scripts in \moonloader, "Reload all scripts" sends CTRL+R
   Mod Loader   -> lists folders in \modloader, click to enable/disable (renames the folder with a
                   leading dot; applies on the next game start)
@@ -37,3 +40,9 @@ How the stock-menu part works (v3)
 
 Diagnostics: the menu writes gta6menu.log next to the .asi (init, hook, menu open/close, every key it
 sends, every click). If something misbehaves, send that file.
+
+Audio/graphics notes
+  Master volume/mute change the game's own entry in the Windows volume mixer (all game sound).
+  Brightness/vignette/tint are drawn over the finished frame while you play (not in menus).
+  FPS cap only lowers the frame rate (it can't exceed the game's own limiter).
+  Settings are saved to gta6menu.ini ([audio] [graphics]).
