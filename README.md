@@ -47,11 +47,16 @@ Audio/graphics notes
   FPS cap only lowers the frame rate (it can't exceed the game's own limiter).
   Settings are saved to gta6menu.ini ([audio] [graphics]).
 
-Real game settings (v4)
-  Settings now read and write the ORIGINAL game settings live (sound effects / radio volume, radio EQ,
-  radio auto-select, brightness, draw distance, frame limiter, mip mapping, widescreen, HUD, radar mode,
-  subtitles) -- the same fields the original menu uses, so they show up in the stock pages too and are
-  saved the same way. The field offsets are generated at build time from plugin-sdk
-  (tools/offsets.cpp + tools/gen_offsets.ps1 -> src/menu_offsets.h). If a field can't be found the row
-  shows "Unavailable" instead of doing anything unsafe. The build artifact includes menu_offsets.h so
-  you can see what was found.
+Real game settings (v5)
+  Settings reads and writes the ORIGINAL game settings directly (no stock pages needed):
+    AUDIO     sound effects volume, radio volume, radio equaliser, radio auto-select,
+              game master volume (Windows mixer), mute
+    GRAPHICS  brightness, draw distance, frame limiter, mip mapping, widescreen,
+              vignette, colour tint, FPS cap
+    GAME      show HUD, radar mode, map legend, subtitles
+    THIS MENU accent colour, background, clock format, FPS counter
+    MORE      resolution/anti-aliasing, controls/key bindings, language, mod configuration
+              (these need the game's own engine screens, so they open the original pages)
+  Values live in FrontEndMenuManager (0xBA6748); the field offsets are in src/menu_offsets.h
+  (GTA SA 1.0 US). Every row checks that the value it reads is sane, otherwise it shows
+  "Unavailable" instead of writing anything. Changes are saved with the game's own save routine.

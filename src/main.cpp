@@ -697,7 +697,7 @@ static void DrawMainPage(bool click)
     const char* descs[5] = {
         "Return to the game.",
         lua ? "Open the GPS big map from your gps_zone_hud script." : "Open the world map.",
-        "Controller, audio, display, language and this menu's own settings.",
+        "Audio, graphics and game options, all in one place.",
         "Lua scripts found in your moonloader folder, with a one-click reload.",
         "Turn the mods in your modloader folder on or off." };
     for (int i = 0; i < 5; ++i) {
@@ -731,7 +731,7 @@ static void DrawMainPage(bool click)
     KeyCap(hx, hy, "ENTER", "SELECT", 34 * S);
 }
 
-// ---- real game settings: CMenuManager fields (offsets come from plugin-sdk at build time) ----
+// ---- real game settings: read and written straight in CMenuManager (see menu_offsets.h) ----
 static const uintptr_t kMenuBase = 0xBA6748;
 #ifndef _MSC_VER
 #define __thiscall
@@ -741,7 +741,6 @@ typedef void(__thiscall* VoidFn)(void*);
 
 static int RdI(int off, int sz)
 {
-    if (off < 0) return 0;
     uintptr_t a = kMenuBase + (uintptr_t)off;
     if (sz == 1) return *(signed char*)a;
     if (sz == 2) return *(short*)a;
@@ -749,19 +748,37 @@ static int RdI(int off, int sz)
 }
 static void WrI(int off, int sz, int v)
 {
-    if (off < 0) return;
     uintptr_t a = kMenuBase + (uintptr_t)off;
     if (sz == 1) *(signed char*)a = (signed char)v;
     else if (sz == 2) *(short*)a = (short)v;
     else *(int*)a = v;
 }
-static float RdF(int off) { return off < 0 ? 0.0f : *(float*)(kMenuBase + (uintptr_t)off); }
-static void WrF(int off, float v) { if (off >= 0) *(float*)(kMenuBase + (uintptr_t)off) = v; }
+static float RdF(int off) { return *(float*)(kMenuBase + (uintptr_t)off); }
+static void WrF(int off, float v) { *(float*)(kMenuBase + (uintptr_t)off) = v; }
 static int Pct(int v) { return std::min(100, std::max(0, v)); }
 
-static void ApplySfx(int v) { if (ADDR_SETFX && ADDR_AUDIOENGINE) reinterpret_cast<VolFn>(ADDR_SETFX)(reinterpret_cast<void*>(ADDR_AUDIOENGINE), (unsigned char)v); }
-static void ApplyMusic(int v) { if (ADDR_SETMUSIC && ADDR_AUDIOENGINE) reinterpret_cast<VolFn>(ADDR_SETMUSIC)(reinterpret_cast<void*>(ADDR_AUDIOENGINE), (unsigned char)v); }
-static void SaveStock() { if (ADDR_SAVESETTINGS) reinterpret_cast<VoidFn>(ADDR_SAVESETTINGS)(reinterpret_cast<void*>(kMenuBase)); }
+static void ApplySfx(int v) { reinterpret_cast<VolFn>(ADDR_SETFX)(reinterpret_cast<void*>(ADDR_AUDIOENGINE), (unsigned char)v); }
+static void ApplyMusic(int v) { reinterpret_cast<VolFn>(ADDR_SETMUSIC)(reinterpret_cast<void*>(ADDR_AUDIOENGINE), (unsigned char)v); }
+static void SaveStock() { reinterpret_cast<VoidFn>(ADDR_SAVESETTINGS)(reinterpret_cast<void*>(kMenuBase)); }
+
+// validators: a row is only usable when the value read from the game looks sane
+static bool V_Sfx() { int v = RdI(OFF_m_nPrefsSfxVolume, SZ_m_nPrefsSfxVolume); return v >= 0 && v <= 64; }
+static bool V_Music() { int v = RdI(OFF_m_nPrefsMusicVolume, SZ_m_nPrefsMusicVolume); return v >= 0 && v <= 64; }
+static bool V_Bright() { int v = RdI(OFF_m_nPrefsBrightness, SZ_m_nPrefsBrightness); return v >= 0 && v <= 384; }
+static bool V_Lod() { float v = RdF(OFF_m_fPrefsLOD); return v >= 0.5f && v <= 3.0f; }
+static bool V_Radar() { int v = RdI(OFF_m_nPrefsRadarMode, SZ_m_nPrefsRadarMode); return v >= 0 && v <= 2; }
+#define BOOL_FN(name, member) \
+    static bool V_##name() { int v = RdI(OFF_##member, SZ_##member); return v == 0 || v == 1; } \
+    static int G_##name() { return RdI(OFF_##member, SZ_##member) ? 1 : 0; } \
+    static void S_##name(int v) { WrI(OFF_##member, SZ_##member, v ? 1 : 0); }
+BOOL_FN(Vsync, m_bPrefsVsync)
+BOOL_FN(Mip, m_bPrefsMipMapping)
+BOOL_FN(Wide, m_bPrefsUseWideScreen)
+BOOL_FN(Hud, m_bPrefsShowHud)
+BOOL_FN(Subs, m_bPrefsShowSubtitles)
+BOOL_FN(Legend, m_bPrefsShowLegends)
+BOOL_FN(RadioEq, m_bPrefsRadioEq)
+BOOL_FN(RadioAuto, m_bPrefsRadioAutoSelect)
 
 static int G_Sfx() { return Pct(RdI(OFF_m_nPrefsSfxVolume, SZ_m_nPrefsSfxVolume) * 100 / 64); }
 static void S_Sfx(int p) { int v = (p * 64 + 50) / 100; WrI(OFF_m_nPrefsSfxVolume, SZ_m_nPrefsSfxVolume, v); ApplySfx(v); }
@@ -776,16 +793,6 @@ static void S_Lod(int p)
     WrF(OFF_m_fPrefsLOD, l);
     if (ADDR_LODSCALE) *reinterpret_cast<float*>(ADDR_LODSCALE) = l;
 }
-#define BOOL_FN(name, member) \
-    static int G_##name() { return RdI(OFF_##member, SZ_##member) ? 1 : 0; } \
-    static void S_##name(int v) { WrI(OFF_##member, SZ_##member, v ? 1 : 0); }
-BOOL_FN(Vsync, m_bPrefsVsync)
-BOOL_FN(Mip, m_bPrefsMipMapping)
-BOOL_FN(Wide, m_bPrefsUseWideScreen)
-BOOL_FN(Hud, m_bPrefsShowHud)
-BOOL_FN(Subs, m_bPrefsShowSubtitles)
-BOOL_FN(RadioEq, m_bPrefsRadioEq)
-BOOL_FN(RadioAuto, m_bPrefsRadioAutoSelect)
 static int G_Radar() { return std::min(2, std::max(0, RdI(OFF_m_nPrefsRadarMode, SZ_m_nPrefsRadarMode))); }
 static void S_Radar(int v) { WrI(OFF_m_nPrefsRadarMode, SZ_m_nPrefsRadarMode, v); }
 
@@ -802,49 +809,51 @@ static void Changed() { InterlockedExchange(&g_audioDirty, 1); }
 
 // ---- settings page ----
 static const char* const kRadarNames[3] = { "Map and blips", "Blips only", "Off" };
-struct Setting { int tab; int kind; const char* label; const char* desc; int (*get)(); void (*set)(int); int mn, mx; const char* const* opts; int link; int req; bool stock; };
-// kinds: 0 toggle, 1 slider (0..100), 2 cycle, 3 action, 4 link to a stock Options sub-page.  req: -2 always available, else a field offset (>=0 available)
+struct Setting { int tab; int kind; const char* label; const char* desc; int (*get)(); void (*set)(int); int mn, mx; const char* const* opts; int link; bool (*valid)(); bool stock; };
+// kinds: 0 toggle, 1 slider (0..100), 2 cycle, 3 action, 4 link to a stock Options page.  valid: nullptr = always usable
 static Setting g_settings[] = {
     // AUDIO
-    { 0, 1, "Sound effects volume", "Volume of sound effects. This is the original game setting.", G_Sfx, S_Sfx, 0, 100, nullptr, 0, OFF_m_nPrefsSfxVolume, true },
-    { 0, 1, "Radio volume", "Volume of the radio and music. This is the original game setting.", G_Music, S_Music, 0, 100, nullptr, 0, OFF_m_nPrefsMusicVolume, true },
-    { 0, 0, "Radio equaliser", "Boosts bass and treble on the radio.", G_RadioEq, S_RadioEq, 0, 1, nullptr, 0, OFF_m_bPrefsRadioEq, true },
-    { 0, 0, "Radio auto-select", "Tunes the radio to a station when you get into a vehicle.", G_RadioAuto, S_RadioAuto, 0, 1, nullptr, 0, OFF_m_bPrefsRadioAutoSelect, true },
-    { 0, 1, "Game master volume", "Volume of the whole game in the Windows mixer, including voice chat.", G_Vol, S_Vol, 0, 100, nullptr, 0, -2, false },
-    { 0, 0, "Mute game", "Silence all game audio without changing any volume.", G_Mute, S_Mute, 0, 1, nullptr, 0, -2, false },
-    { 0, 4, "Audio setup (original)", "Open the original audio setup page.", nullptr, nullptr, 0, 0, nullptr, 1, -2, false },
+    { 0, 1, "Sound effects volume", "Volume of sound effects (original game setting).", G_Sfx, S_Sfx, 0, 100, nullptr, 0, V_Sfx, true },
+    { 0, 1, "Radio volume", "Volume of the radio and music (original game setting).", G_Music, S_Music, 0, 100, nullptr, 0, V_Music, true },
+    { 0, 0, "Radio equaliser", "Boosts bass and treble on the radio.", G_RadioEq, S_RadioEq, 0, 1, nullptr, 0, V_RadioEq, true },
+    { 0, 0, "Radio auto-select", "Tunes the radio to a station when you get into a vehicle.", G_RadioAuto, S_RadioAuto, 0, 1, nullptr, 0, V_RadioAuto, true },
+    { 0, 1, "Game master volume", "Volume of the whole game in the Windows mixer, including voice chat.", G_Vol, S_Vol, 0, 100, nullptr, 0, nullptr, false },
+    { 0, 0, "Mute game", "Silence all game audio without changing any volume.", G_Mute, S_Mute, 0, 1, nullptr, 0, nullptr, false },
     // GRAPHICS
-    { 1, 1, "Brightness", "Screen brightness. This is the original game setting.", G_Bright, S_Bright, 0, 100, nullptr, 0, OFF_m_nPrefsBrightness, true },
-    { 1, 1, "Draw distance", "How far the world is drawn. Higher values look better and cost performance.", G_Lod, S_Lod, 0, 100, nullptr, 0, OFF_m_fPrefsLOD, true },
-    { 1, 0, "Frame limiter", "Locks the frame rate to the screen (vsync).", G_Vsync, S_Vsync, 0, 1, nullptr, 0, OFF_m_bPrefsVsync, true },
-    { 1, 0, "Mip mapping", "Smoother textures at a distance.", G_Mip, S_Mip, 0, 1, nullptr, 0, OFF_m_bPrefsMipMapping, true },
-    { 1, 0, "Widescreen", "Stretches the picture for widescreen displays.", G_Wide, S_Wide, 0, 1, nullptr, 0, OFF_m_bPrefsUseWideScreen, true },
-    { 1, 1, "Vignette", "Darkens the edges of the screen for a cinematic look.", G_Vig, S_Vig, 0, 100, nullptr, 0, -2, false },
-    { 1, 2, "Colour tint", "Warm gives a sunset feel, cool a night feel.", G_Tint, S_Tint, 0, 2, kTintNames, 0, -2, false },
-    { 1, 2, "FPS cap", "Limits the frame rate. It can only lower the game's own limit.", G_FpsCap, S_FpsCap, 0, 5, kFpsNames, 0, -2, false },
-    { 1, 4, "Display setup (original)", "Resolution, anti-aliasing and the other original display options.", nullptr, nullptr, 0, 0, nullptr, 2, -2, false },
+    { 1, 1, "Brightness", "Screen brightness (original game setting).", G_Bright, S_Bright, 0, 100, nullptr, 0, V_Bright, true },
+    { 1, 1, "Draw distance", "How far the world is drawn. Higher looks better and costs performance. Takes full effect after a restart.", G_Lod, S_Lod, 0, 100, nullptr, 0, V_Lod, true },
+    { 1, 0, "Frame limiter", "Locks the frame rate to the screen (vsync).", G_Vsync, S_Vsync, 0, 1, nullptr, 0, V_Vsync, true },
+    { 1, 0, "Mip mapping", "Smoother textures at a distance. Takes full effect after a restart.", G_Mip, S_Mip, 0, 1, nullptr, 0, V_Mip, true },
+    { 1, 0, "Widescreen", "Stretches the picture for widescreen displays.", G_Wide, S_Wide, 0, 1, nullptr, 0, V_Wide, true },
+    { 1, 1, "Vignette", "Darkens the edges of the screen for a cinematic look.", G_Vig, S_Vig, 0, 100, nullptr, 0, nullptr, false },
+    { 1, 2, "Colour tint", "Warm gives a sunset feel, cool a night feel.", G_Tint, S_Tint, 0, 2, kTintNames, 0, nullptr, false },
+    { 1, 2, "FPS cap", "Limits the frame rate. It can only lower the game's own limit.", G_FpsCap, S_FpsCap, 0, 5, kFpsNames, 0, nullptr, false },
     // GAME
-    { 2, 0, "Show HUD", "Show or hide the on-screen HUD.", G_Hud, S_Hud, 0, 1, nullptr, 0, OFF_m_bPrefsShowHud, true },
-    { 2, 2, "Radar mode", "Map and blips, blips only, or no radar.", G_Radar, S_Radar, 0, 2, kRadarNames, 0, OFF_m_nPrefsRadarMode, true },
-    { 2, 0, "Subtitles", "Show subtitles for dialogue.", G_Subs, S_Subs, 0, 1, nullptr, 0, OFF_m_bPrefsShowSubtitles, true },
-    { 2, 4, "Controller setup", "Open the original controller setup: mouse, keyboard and gamepad options.", nullptr, nullptr, 0, 0, nullptr, 0, -2, false },
-    { 2, 4, "Language", "Open the original language page.", nullptr, nullptr, 0, 0, nullptr, 3, -2, false },
-    { 2, 4, "Mod configuration", "Open the mod configuration page added by your mods.", nullptr, nullptr, 0, 0, nullptr, 4, -2, false },
+    { 2, 0, "Show HUD", "Show or hide the on-screen HUD.", G_Hud, S_Hud, 0, 1, nullptr, 0, V_Hud, true },
+    { 2, 2, "Radar mode", "Map and blips, blips only, or no radar.", G_Radar, S_Radar, 0, 2, kRadarNames, 0, V_Radar, true },
+    { 2, 0, "Map legend", "Show the legend of blip icons on the map.", G_Legend, S_Legend, 0, 1, nullptr, 0, V_Legend, true },
+    { 2, 0, "Subtitles", "Show subtitles for dialogue.", G_Subs, S_Subs, 0, 1, nullptr, 0, V_Subs, true },
     // THIS MENU
-    { 3, 2, "Accent colour", "Colour of the clock, toggles and highlights in this menu.", G_Accent, S_Accent, 0, 3, kAccentNames, 0, -2, false },
-    { 3, 2, "Background", "Backdrop gradient shown behind the main page.", G_Bg, S_Bg, 0, 2, kBgNames, 0, -2, false },
-    { 3, 0, "24-hour clock", "Show the clock in 24-hour format instead of AM/PM.", G_H24, S_H24, 0, 1, nullptr, 0, -2, false },
-    { 3, 0, "Show FPS", "Show the frame rate in the top-left corner.", G_ShowFps, S_ShowFps, 0, 1, nullptr, 0, -2, false },
-    { 3, 3, "Restore defaults", "Reset this menu's own settings (not the original game settings).", nullptr, S_Restore, 0, 0, nullptr, 0, -2, false },
+    { 3, 2, "Accent colour", "Colour of the clock, toggles and highlights in this menu.", G_Accent, S_Accent, 0, 3, kAccentNames, 0, nullptr, false },
+    { 3, 2, "Background", "Backdrop gradient shown behind the main page.", G_Bg, S_Bg, 0, 2, kBgNames, 0, nullptr, false },
+    { 3, 0, "24-hour clock", "Show the clock in 24-hour format instead of AM/PM.", G_H24, S_H24, 0, 1, nullptr, 0, nullptr, false },
+    { 3, 0, "Show FPS", "Show the frame rate in the top-left corner.", G_ShowFps, S_ShowFps, 0, 1, nullptr, 0, nullptr, false },
+    { 3, 3, "Restore defaults", "Reset this menu's own settings (not the original game settings).", nullptr, S_Restore, 0, 0, nullptr, 0, nullptr, false },
+    // MORE: things that need the game's own engine screens (resolution change, key bindings, ...)
+    { 4, 4, "Resolution and anti-aliasing", "Opens the original display page. Changing the resolution or anti-aliasing has to go through the game's own video-mode code.", nullptr, nullptr, 0, 0, nullptr, 2, nullptr, false },
+    { 4, 4, "Controls and key bindings", "Opens the original controller setup: mouse, keyboard, gamepad and redefine controls.", nullptr, nullptr, 0, 0, nullptr, 0, nullptr, false },
+    { 4, 4, "Language", "Opens the original language page.", nullptr, nullptr, 0, 0, nullptr, 3, nullptr, false },
+    { 4, 4, "Mod configuration", "Opens the mod configuration page added by your mods.", nullptr, nullptr, 0, 0, nullptr, 4, nullptr, false },
 };
-static const char* const kSettingsTabs[4] = { "AUDIO", "GRAPHICS", "GAME", "THIS MENU" };
+static const int kSettingsCount = (int)(sizeof(g_settings) / sizeof(g_settings[0]));
+static const char* const kSettingsTabs[5] = { "AUDIO", "GRAPHICS", "GAME", "THIS MENU", "MORE" };
 static int g_dragIdx = -1;
 
 static void Commit(const Setting& s) { Changed(); SaveIni(); if (s.stock) SaveStock(); }
 
 static void DrawSettingRow(int idx, const Setting& s, float x, float y, float w, float h, bool click, int& hoverRow)
 {
-    const bool avail = s.req == -2 || s.req >= 0;
+    const bool avail = !s.valid || s.valid();
     bool hov = ListRow(x, y, w, h, true);
     if (hov) hoverRow = idx;
     DWORD fg = hov ? INK : WHITE;
@@ -860,7 +869,7 @@ static void DrawSettingRow(int idx, const Setting& s, float x, float y, float w,
         float cy = y + h * 0.5f, a = 8 * S;
         Line(rx - a, cy - a, rx, cy, 3 * S, fg);
         Line(rx, cy, rx - a, cy + a, 3 * S, fg);
-        if (hov && click) OpenOptionsCategory(s.link);
+        if (hov && click && !Busy()) OpenOptionsCategory(s.link);
     } else if (s.kind == 3) {
         if (hov && click) { s.set(0); Commit(s); }
     } else if (s.kind == 0) {
@@ -918,12 +927,13 @@ static void DrawSettingRow(int idx, const Setting& s, float x, float y, float w,
 static void DrawSettingsPage(bool click, bool keyQ, bool keyE)
 {
     DrawPurpleBackground();
-    if (keyQ) g_stab = (g_stab + 3) % 4;
-    if (keyE) g_stab = (g_stab + 1) % 4;
+    const int tabs = 5;
+    if (keyQ) g_stab = (g_stab + tabs - 1) % tabs;
+    if (keyE) g_stab = (g_stab + 1) % tabs;
 
     Text(4, 32 * S, 20 * S, WHITE, "SETTINGS");
     float tx = 32 * S;
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < tabs; ++i) {
         float tw = TextW(0, kSettingsTabs[i]) + 40 * S, th = 38 * S, ty = 78 * S;
         bool hov = Hit(tx, ty, tw, th, (float)g_mx, (float)g_my);
         if (hov && click) g_stab = i;
@@ -935,7 +945,7 @@ static void DrawSettingsPage(bool click, bool keyQ, bool keyE)
     Text(2, 32 * S, 150 * S, WHITE, kSettingsTabs[g_stab]);
 
     int hoverRow = -1, row = 0, firstIdx = -1;
-    for (int i = 0; i < (int)(sizeof(g_settings) / sizeof(g_settings[0])); ++i) {
+    for (int i = 0; i < kSettingsCount; ++i) {
         if (g_settings[i].tab != g_stab) continue;
         if (firstIdx < 0) firstIdx = i;
         int shownIdx = -1;
@@ -951,7 +961,7 @@ static void DrawSettingsPage(bool click, bool keyQ, bool keyE)
     Rect(dx, 216 * S, 640 * S, 2 * S, 0x5AFFFFFF);
     WrapText(dx, 238 * S, 640 * S, 0xE6FFFFFF, shown->desc);
 
-    char pg[16]; sprintf(pg, "%d / 4", g_stab + 1);
+    char pg[16]; sprintf(pg, "%d / %d", g_stab + 1, tabs);
     Text(1, 48 * S, H - 150 * S, WHITE, pg);
     BackHints(click, "TABS");
 }
